@@ -121,6 +121,26 @@ camera opened from the ring notification can start without a separate manual ste
 Current media support is one-way: door station → Home Assistant/browser video and
 audio. Browser/HomeKit talkback is not supported yet.
 
+### Talkback prototype status
+
+Two-way audio is being validated outside the integration before it is exposed in
+Home Assistant. The verified uplink mode is:
+
+- one continuous Linphone-like audio RTP leg on the same local UDP audio port used
+  for the call;
+- PCMA / G.711 A-law, static RTP payload type 8;
+- 8 kHz mono, 20 ms packets (`a=ptime:20`, 160 PCMA bytes per packet);
+- idle/muted state sends PCMA silence continuously;
+- push-to-talk swaps queued voice frames into that same RTP sequence, timestamp,
+  and SSRC;
+- no separate local ABB mute command is required for this path.
+
+The standalone prototype has verified this against the real gateway/station: a
+2.5 s `Door opening` probe produced audible station audio with `voice=125` RTP
+packets and `dropped=0`. This is not wired into the HA integration yet; the
+stable integration intentionally remains one-way until browser/native mic input,
+lifecycle handling, and HomeKit export semantics are proven.
+
 ### Realtime ring event payload
 
 Every incoming SIP ring fires `abb_welcome_ring` on the Home Assistant event bus.
