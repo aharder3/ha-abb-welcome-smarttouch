@@ -3,13 +3,18 @@
     "step": {
       "user": {
         "title": "ABB Welcome",
-        "description": "Pair this Home Assistant instance with your ABB Welcome IP gateway.\n\nFour fields:\n• MyBuildings portal username and password (same as the official ABB Welcome mobile app).\n• Gateway local IP address.\n• Gateway web admin password (the one used at https://gateway-ip/).\n\nAfter you submit, the integration finishes pairing automatically — no need to open the gateway web admin yourself.",
+        "description": "Pair this Home Assistant instance with your ABB Welcome IP gateway.\n\nRequired fields:\n• MyBuildings portal username and password (same as the official ABB Welcome mobile app).\n• Gateway local IP address.\n• Gateway web admin password (the one used at https://gateway-ip/).\n\nOptional:\n• Gateway Portal UUID — only fill this in if the automatic setup fails (some firmware versions have a broken portal-client endpoint). You can find this value in the gateway web admin under the Portal page (label “Portal Client UUID”), or in the ABB Welcome mobile app settings. Leave blank otherwise.\n\nAfter you submit, the integration finishes pairing automatically — no need to open the gateway web admin yourself.",
         "data": {
           "abb_username": "Portal Username",
           "abb_password": "Portal Password",
           "gateway_ip": "Gateway IP Address",
-          "gateway_password": "Gateway Admin Password"
+          "gateway_password": "Gateway Admin Password",
+          "gateway_uuid_override": "Gateway Portal UUID (optional)"
         }
+      },
+      "manual_authorize": {
+        "title": "Approve pairing on the gateway",
+        "description": "Auto-approval failed, but the pairing request was sent successfully and is waiting on your gateway. Please finish the approval manually:\n\n1. Open https://{gateway_ip}/ in a browser and log in as `admin`.\n2. Navigate to the **Portal / Portal Client** page.\n3. Find the pending app named:\n\n    **{client_name}**\n\n4. When prompted for an integrity code, enter:\n\n    **{integrity_code}**\n\n5. Confirm / Approve in the gateway UI.\n6. Click **Submit** below to continue.\n\nHome Assistant will wait up to 5 minutes for the gateway to confirm the pairing.\n\n_Diagnostic detail: {error_detail}_"
       },
       "confirm": {
         "title": "Confirm Setup",
@@ -24,6 +29,8 @@
       "no_pending_app": "The gateway did not see our pairing request. Try again or check that the portal account is linked to this gateway.",
       "integrity_code_rejected": "The gateway rejected the integrity code we computed. Open an issue with your gateway firmware version.",
       "gateway_admin_failed": "Talking to the gateway admin CGI failed — see the Home Assistant log.",
+      "gateway_op6_failed": "Could not read the gateway's portal UUID. Some firmware versions have a broken portal-client endpoint. Fill in the optional 'Gateway Portal UUID' field and try again.",
+      "invalid_uuid": "Gateway Portal UUID must look like 8d24f178-9c41-4aed-97e1-6008bb6aef82 (8-4-4-4-12 hex). Leave blank to auto-detect.",
       "unknown": "Unexpected error — see the Home Assistant log."
     },
     "abort": {

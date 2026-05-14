@@ -5,6 +5,7 @@ DOMAIN = "abb_welcome"
 CONF_ABB_USERNAME = "abb_username"
 CONF_ABB_PASSWORD = "abb_password"
 CONF_GATEWAY_IP = "gateway_ip"
+CONF_GATEWAY_UUID_OVERRIDE = "gateway_uuid_override"
 
 GEO_URL = "https://geo.mybuildings.abb.com"
 DEFAULT_PORTAL_URL = "https://api.eu.mybuildings.abb.com"

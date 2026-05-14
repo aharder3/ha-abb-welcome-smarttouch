@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import socket
 
 import voluptuous as vol
@@ -20,6 +21,7 @@ from .const import (
     CONF_ABB_PASSWORD,
     CONF_ABB_USERNAME,
     CONF_GATEWAY_IP,
+    CONF_GATEWAY_UUID_OVERRIDE,
     CONF_UNLOCK_STRATEGY,
     DEFAULT_UNLOCK_STRATEGY,
     DOMAIN,
@@ -57,7 +59,12 @@ def _log_error(msg: str, *args: object) -> None:
 CONF_GATEWAY_PASSWORD = "gateway_password"  # noqa: S105 (config-flow field name)
 
 POLL_ATTEMPTS = 60
+POLL_ATTEMPTS_MANUAL = 100  # ~5 minutes — gives user time to click through the gateway UI
 POLL_INTERVAL = 3.0
+
+_UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+)
 
 STEP_USER_DATA_SCHEMA = vol.Schema(
     {
@@ -69,6 +76,7 @@ STEP_USER_DATA_SCHEMA = vol.Schema(
         vol.Required(CONF_GATEWAY_PASSWORD): selector.TextSelector(
             selector.TextSelectorConfig(type=selector.TextSelectorType.PASSWORD)
         ),
+        vol.Optional(CONF_GATEWAY_UUID_OVERRIDE, default=""): str,
     }
 )
 
@@ -105,12 +113,15 @@ class ABBWelcomeConfigFlow(ConfigFlow, domain=DOMAIN):
         self._sip_domain = ""
         self._own_uuid = ""
         self._gateway_uuid = ""
+        self._gateway_uuid_override = ""
         self._gateway_name = ""
         self._gateway_sid = ""
         self._fingerprint = ""
         self._integrity_eight = ""
         self._integrity_display = ""
         self._doors: list[dict] = []
+        self._manual_authorize = False
+        self._authorize_error_msg = ""
 
     async def _check_unique(self, gateway_uuid: str) -> ConfigFlowResult | None:
         await self.async_set_unique_id(gateway_uuid)
@@ -131,27 +142,34 @@ class ABBWelcomeConfigFlow(ConfigFlow, domain=DOMAIN):
             self._password = user_input[CONF_ABB_PASSWORD]
             self._gateway_ip = user_input[CONF_GATEWAY_IP].strip()
             self._gateway_password = user_input[CONF_GATEWAY_PASSWORD]
+            uuid_raw = user_input.get(CONF_GATEWAY_UUID_OVERRIDE, "").strip().lower()
+            if uuid_raw and not _UUID_RE.fullmatch(uuid_raw):
+                errors[CONF_GATEWAY_UUID_OVERRIDE] = "invalid_uuid"
+            self._gateway_uuid_override = uuid_raw
 
-            reachable = await self.hass.async_add_executor_job(
-                _gateway_reachable, self._gateway_ip, SIP_PORT
-            )
-            if not reachable:
-                errors["base"] = "cannot_connect"
-            else:
+            if not errors:
+                reachable = await self.hass.async_add_executor_job(
+                    _gateway_reachable, self._gateway_ip, SIP_PORT
+                )
+                if not reachable:
+                    errors["base"] = "cannot_connect"
+
+            if not errors:
+                # Phase 1: portal-side setup + send connect event to gateway.
+                # Errors here are unrecoverable (we never put a pending request
+                # on the gateway), so they go straight back to the form.
                 try:
                     await self.hass.async_add_executor_job(self._do_pairing_setup)
-                    await self.hass.async_add_executor_job(self._do_gateway_authorize)
-                    return await self.async_step_poll_acl()
                 except GatewayAdminError as err:
                     msg = str(err).lower()
                     if "login failed" in msg:
                         errors["base"] = "gateway_admin_auth_failed"
-                    elif "no pending app" in msg:
-                        errors["base"] = "no_pending_app"
-                    elif "integrity code" in msg:
-                        errors["base"] = "integrity_code_rejected"
+                    elif "missing uuid" in msg or "op=6" in msg:
+                        # Local op=6 lookup failed and user didn't supply an
+                        # override. Tell them how to recover.
+                        errors["base"] = "gateway_op6_failed"
                     else:
-                        _log_error("Gateway admin error: %s", err)
+                        _log_error("Gateway admin error during setup: %s", err)
                         errors["base"] = "gateway_admin_failed"
                 except PortalError as err:
                     msg = str(err).lower()
@@ -163,8 +181,38 @@ class ABBWelcomeConfigFlow(ConfigFlow, domain=DOMAIN):
                         _log_error("Portal pairing error: %s", err)
                         errors["base"] = "unknown"
                 except Exception as err:  # noqa: BLE001
-                    _LOGGER.exception("Unexpected portal pairing error: %s", err)
+                    _LOGGER.exception("Unexpected portal setup error: %s", err)
                     errors["base"] = "unknown"
+                else:
+                    # Phase 2: auto-approve on the gateway. By this point the
+                    # connect event was successfully sent, so the gateway has
+                    # a pending request — recoverable via the manual UI even
+                    # if our CGI calls fail.
+                    try:
+                        await self.hass.async_add_executor_job(
+                            self._do_gateway_authorize
+                        )
+                    except GatewayAdminError as err:
+                        msg = str(err).lower()
+                        if "login failed" in msg:
+                            # Wrong admin password — manual flow can't recover.
+                            errors["base"] = "gateway_admin_auth_failed"
+                        else:
+                            _log_info(
+                                "Auto-approve failed (%s); offering manual "
+                                "approval via the gateway web UI",
+                                err,
+                            )
+                            self._manual_authorize = True
+                            self._authorize_error_msg = str(err)
+                            return await self.async_step_manual_authorize()
+                    except Exception as err:  # noqa: BLE001
+                        _LOGGER.exception(
+                            "Unexpected error during auto-approve: %s", err
+                        )
+                        errors["base"] = "unknown"
+                    else:
+                        return await self.async_step_poll_acl()
 
         return self.async_show_form(
             step_id="user",
@@ -193,10 +241,17 @@ class ABBWelcomeConfigFlow(ConfigFlow, domain=DOMAIN):
         self._own_uuid = identity["own_portal_uuid"]
 
         # Get the gateway UUID from the gateway itself — the portal's
-        # discovery event has a race for brand-new identities.
-        gw_info = gateway_local_info(self._gateway_ip, self._gateway_password)
-        self._gateway_uuid = gw_info["uuid"]
-        self._gateway_name = gw_info.get("portalname") or "ABB Welcome Gateway"
+        # discovery event has a race for brand-new identities. If the user
+        # supplied an override (some firmware revisions have a broken
+        # portalclient.cgi op=6 — see GitHub issue #1), skip the local
+        # lookup entirely and trust the value they pasted in.
+        if self._gateway_uuid_override:
+            self._gateway_uuid = self._gateway_uuid_override
+            self._gateway_name = "ABB Welcome Gateway"
+        else:
+            gw_info = gateway_local_info(self._gateway_ip, self._gateway_password)
+            self._gateway_uuid = gw_info["uuid"]
+            self._gateway_name = gw_info.get("portalname") or "ABB Welcome Gateway"
 
         self._integrity_eight, self._integrity_display = compute_integrity_code(
             self._fingerprint
@@ -219,10 +274,34 @@ class ABBWelcomeConfigFlow(ConfigFlow, domain=DOMAIN):
             self._integrity_eight,
         )
 
+    async def async_step_manual_authorize(
+        self, user_input: dict | None = None
+    ) -> ConfigFlowResult:
+        """Show manual-approval instructions when auto-approve fails.
+
+        The pairing request is already on the gateway (the portal connect
+        event went through), so the user can finish the approval via the
+        gateway's own web UI.
+        """
+        if user_input is not None:
+            return await self.async_step_poll_acl()
+
+        return self.async_show_form(
+            step_id="manual_authorize",
+            data_schema=vol.Schema({}),
+            description_placeholders={
+                "gateway_ip": self._gateway_ip,
+                "client_name": self._client_name,
+                "integrity_code": self._integrity_display,
+                "error_detail": self._authorize_error_msg or "(no details)",
+            },
+        )
+
     async def async_step_poll_acl(
         self, user_input: dict | None = None
     ) -> ConfigFlowResult:
-        """Poll for the ACL-update event the gateway pushed after auto-approve."""
+        """Poll for the ACL-update event the gateway pushed after approval."""
+        attempts = POLL_ATTEMPTS_MANUAL if self._manual_authorize else POLL_ATTEMPTS
         try:
             payload = await self.hass.async_add_executor_job(
                 poll_acl_update,
@@ -230,7 +309,7 @@ class ABBWelcomeConfigFlow(ConfigFlow, domain=DOMAIN):
                 self._cert_pem,
                 self._private_key_pem,
                 self._own_uuid,
-                POLL_ATTEMPTS,
+                attempts,
                 POLL_INTERVAL,
             )
         except Exception as err:  # noqa: BLE001
