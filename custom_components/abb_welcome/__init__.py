@@ -4,11 +4,9 @@ import json
 import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import unquote
 
-
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
+import requests
 import voluptuous as vol
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
@@ -23,6 +21,11 @@ from .sip_listener import IncomingCall, SipListener
 from .streaming_state import ARM_REASON_RING, RING_ARM_SECONDS, arm
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
 
 for _name in (
     "custom_components.abb_welcome",
@@ -86,6 +89,11 @@ def _build_client(entry: ConfigEntry) -> SIPClient:
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up ABB Welcome from a config entry."""
+    # Refresh the door topology before entities are created.  This makes a
+    # normal config-entry reload pick up outdoor stations added/removed via
+    # the gateway admin UI, without re-running the pairing/config flow.
+    await _async_refresh_doors_for_entry(hass, entry, reload_on_change=False)
+
     coordinator = ABBWelcomeCoordinator(hass, entry)
 
     entry_data: dict = {
@@ -205,6 +213,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 
 SERVICE_EXPORT_CREDENTIALS = "export_credentials"
+SERVICE_REFRESH_DOORS = "refresh_doors"
 EXPORT_FIELDS = (
     "gateway_ip",
     "sip_username",
@@ -218,64 +227,242 @@ EXPORT_FIELDS = (
     "abb_username",
 )
 
+_GATEWAY_ADMIN_TIMEOUT = 8
+_GATEWAY_LOGIN_OK_RESPONSES = {"1", "2"}
+
+
+def _fetch_gateway_device_list(gateway_ip: str, admin_password: str) -> str:
+    """Read the gateway admin device-list CGI response."""
+    errors: list[str] = []
+    for scheme in ("http", "https"):
+        base = f"{scheme}://{gateway_ip}"
+        try:
+            with requests.Session() as session:
+                login = session.get(
+                    f"{base}/cgi-bin/checklogin.cgi",
+                    params={"name": "admin", "pwd": admin_password},
+                    timeout=_GATEWAY_ADMIN_TIMEOUT,
+                    verify=False,
+                )
+                body = login.text.strip()
+                if (
+                    login.status_code != 200
+                    or body not in _GATEWAY_LOGIN_OK_RESPONSES
+                ):
+                    errors.append(
+                        f"{scheme}: login returned HTTP {login.status_code} "
+                        f"body={body!r}"
+                    )
+                    continue
+
+                response = session.get(
+                    f"{base}/cgi-bin/adduser.cgi",
+                    params={"type": "getdevicelist"},
+                    headers={"Referer": f"{base}/config.html"},
+                    timeout=_GATEWAY_ADMIN_TIMEOUT,
+                    verify=False,
+                )
+                if response.status_code != 200:
+                    errors.append(
+                        f"{scheme}: getdevicelist returned HTTP "
+                        f"{response.status_code}"
+                    )
+                    continue
+                return response.text.strip()
+        except requests.RequestException as err:
+            errors.append(f"{scheme}: {err}")
+
+    raise RuntimeError("; ".join(errors) or "gateway returned no device list")
+
+
+def _parse_gateway_doors(raw: str, sip_domain: str) -> list[dict]:
+    """Parse adduser.cgi?type=getdevicelist into entry.data['doors']."""
+    doors: list[dict] = []
+    for item in filter(None, raw.split(";")):
+        parts = item.split("+")
+        if len(parts) < 3 or not parts[0].startswith("outdoorstation_"):
+            continue
+
+        device_id = parts[1].strip()
+        name = unquote(parts[2].strip())
+        if not device_id or not name:
+            continue
+
+        station_id = f"10000000{device_id}"
+        doors.append(
+            {
+                "name": name,
+                "address": f"sip:{station_id}@{sip_domain}",
+                "station_id": station_id,
+                "body": "1",
+                "index": len(doors),
+            }
+        )
+    return doors
+
+
+def _fetch_doors_from_gateway(
+    gateway_ip: str, admin_password: str, sip_domain: str
+) -> list[dict] | None:
+    """Pull the current outdoor-station list from the gateway admin CGI."""
+    try:
+        raw = _fetch_gateway_device_list(gateway_ip, admin_password)
+    except RuntimeError as err:
+        _LOGGER.error("[abb] refresh_doors: gateway HTTP error: %s", err)
+        return None
+
+    doors = _parse_gateway_doors(raw, sip_domain)
+    if not doors:
+        _LOGGER.warning(
+            "[abb] refresh_doors: gateway returned no outdoorstation entries "
+            "(raw=%r)",
+            raw,
+        )
+        return None
+    return doors
+
+
+def _doors_equal(a: list[dict], b: list[dict]) -> bool:
+    """Compare door lists ignoring persisted index metadata."""
+    keys = ("name", "address", "station_id", "body")
+    return [tuple(door.get(key) for key in keys) for door in a] == [
+        tuple(door.get(key) for key in keys) for door in b
+    ]
+
+
+async def _async_refresh_doors_for_entry(
+    hass: HomeAssistant, entry: ConfigEntry, *, reload_on_change: bool
+) -> bool:
+    """Refresh one config entry's stored door topology from the gateway."""
+    gateway_ip = entry.data.get("gateway_ip")
+    admin_password = entry.data.get("gateway_admin_password")
+    sip_domain = entry.data.get("sip_domain")
+    if not (gateway_ip and admin_password and sip_domain):
+        _LOGGER.warning(
+            "[abb] refresh_doors: entry %s missing gateway_ip, "
+            "gateway_admin_password, or sip_domain; skipping",
+            entry.entry_id,
+        )
+        return False
+
+    new_doors = await hass.async_add_executor_job(
+        _fetch_doors_from_gateway,
+        gateway_ip,
+        admin_password,
+        sip_domain,
+    )
+    if new_doors is None:
+        return False
+
+    current = entry.data.get("doors", []) or []
+    if _doors_equal(current, new_doors):
+        _LOGGER.info(
+            "[abb] refresh_doors: entry %s already up to date (%d door(s))",
+            entry.entry_id,
+            len(current),
+        )
+        return False
+
+    _LOGGER.warning(
+        "[abb] refresh_doors: entry %s — updating doors %d -> %d",
+        entry.entry_id,
+        len(current),
+        len(new_doors),
+    )
+    hass.config_entries.async_update_entry(
+        entry, data={**entry.data, "doors": new_doors}
+    )
+    if reload_on_change:
+        await hass.config_entries.async_reload(entry.entry_id)
+    return True
+
 
 @callback
 def _async_register_services(hass: HomeAssistant) -> None:
     """Register integration-wide services. Idempotent — safe to call on every entry setup."""
-    if hass.services.has_service(DOMAIN, SERVICE_EXPORT_CREDENTIALS):
-        return
+    if not hass.services.has_service(DOMAIN, SERVICE_EXPORT_CREDENTIALS):
 
-    async def _export_creds(call: ServiceCall) -> None:
-        target_entry_id = call.data.get("entry_id")
-        path = call.data.get("path") or "/config/abb_welcome_creds.json"
+        async def _export_creds(call: ServiceCall) -> None:
+            target_entry_id = call.data.get("entry_id")
+            path = call.data.get("path") or "/config/abb_welcome_creds.json"
 
-        entries = hass.data.get(DOMAIN, {})
-        if not entries:
-            raise ValueError("No ABB Welcome config entries are loaded")
+            entries = hass.data.get(DOMAIN, {})
+            if not entries:
+                raise ValueError("No ABB Welcome config entries are loaded")
 
-        if target_entry_id:
-            if target_entry_id not in entries:
-                raise ValueError(f"No config entry with id={target_entry_id!r}")
-            entry_ids = [target_entry_id]
-        else:
-            entry_ids = list(entries.keys())
+            if target_entry_id:
+                if target_entry_id not in entries:
+                    raise ValueError(f"No config entry with id={target_entry_id!r}")
+                entry_ids = [target_entry_id]
+            else:
+                entry_ids = list(entries.keys())
 
-        payload: dict = {"exported_at": _now_iso(), "entries": []}
-        for eid in entry_ids:
-            entry = hass.config_entries.async_get_entry(eid)
-            if entry is None:
-                continue
-            data = entry.data
-            payload["entries"].append(
-                {
-                    "entry_id": eid,
-                    "title": entry.title,
-                    **{k: data.get(k) for k in EXPORT_FIELDS if k in data},
-                    "options": dict(entry.options),
-                }
+            payload: dict = {"exported_at": _now_iso(), "entries": []}
+            for eid in entry_ids:
+                entry = hass.config_entries.async_get_entry(eid)
+                if entry is None:
+                    continue
+                data = entry.data
+                payload["entries"].append(
+                    {
+                        "entry_id": eid,
+                        "title": entry.title,
+                        **{k: data.get(k) for k in EXPORT_FIELDS if k in data},
+                        "options": dict(entry.options),
+                    }
+                )
+
+            target = Path(path)
+            await hass.async_add_executor_job(
+                target.write_text, json.dumps(payload, indent=2)
+            )
+            _LOGGER.warning(
+                "[abb] Credentials exported to %s — file contains the SIP password, "
+                "private key, and gateway admin password. Treat as sensitive.",
+                target,
             )
 
-        target = Path(path)
-        await hass.async_add_executor_job(
-            target.write_text, json.dumps(payload, indent=2)
-        )
-        _LOGGER.warning(
-            "[abb] Credentials exported to %s — file contains the SIP password, "
-            "private key, and gateway admin password. Treat as sensitive.",
-            target,
+        hass.services.async_register(
+            DOMAIN,
+            SERVICE_EXPORT_CREDENTIALS,
+            _export_creds,
+            schema=vol.Schema(
+                {
+                    vol.Optional("entry_id"): str,
+                    vol.Optional("path"): str,
+                }
+            ),
         )
 
-    hass.services.async_register(
-        DOMAIN,
-        SERVICE_EXPORT_CREDENTIALS,
-        _export_creds,
-        schema=vol.Schema(
-            {
-                vol.Optional("entry_id"): str,
-                vol.Optional("path"): str,
-            }
-        ),
-    )
+    if not hass.services.has_service(DOMAIN, SERVICE_REFRESH_DOORS):
+
+        async def _refresh_doors(call: ServiceCall) -> None:
+            target_entry_id = call.data.get("entry_id")
+            entries = hass.data.get(DOMAIN, {})
+            if not entries:
+                raise ValueError("No ABB Welcome config entries are loaded")
+
+            if target_entry_id:
+                if target_entry_id not in entries:
+                    raise ValueError(f"No config entry with id={target_entry_id!r}")
+                entry_ids = [target_entry_id]
+            else:
+                entry_ids = list(entries.keys())
+
+            for eid in entry_ids:
+                entry = hass.config_entries.async_get_entry(eid)
+                if entry is None:
+                    continue
+                await _async_refresh_doors_for_entry(
+                    hass, entry, reload_on_change=True
+                )
+
+        hass.services.async_register(
+            DOMAIN,
+            SERVICE_REFRESH_DOORS,
+            _refresh_doors,
+            schema=vol.Schema({vol.Optional("entry_id"): str}),
+        )
 
 
 async def _async_options_updated(hass: HomeAssistant, entry: ConfigEntry) -> None:

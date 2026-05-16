@@ -20,3 +20,19 @@ export_credentials:
       required: false
       selector:
         text:
+
+refresh_doors:
+  name: Refresh outdoor stations
+  description: >-
+    Re-read the outdoor station list from the gateway admin CGI, update the
+    stored door topology, and reload the ABB Welcome config entry when the
+    list changed. Use this after adding or removing an outdoor station in the
+    gateway web UI.
+  fields:
+    entry_id:
+      name: Entry ID
+      description: Optional. Specific config-entry ID to refresh. Defaults to all loaded entries.
+      example: "01H7AS9A3B4C5D6E7F8G9HABCD"
+      required: false
+      selector:
+        text:
