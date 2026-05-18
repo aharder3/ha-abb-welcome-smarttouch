@@ -12,7 +12,7 @@ complete in well under 100 ms.
 
 ## Features
 
-- One Home Assistant **button entity per outdoor station** (Outdoor 1 / Inner / Parking, etc.).
+- One Home Assistant **button entity per unlock-capable outdoor station** (Outdoor 1 / Inner / Parking, etc.).
 - **WebRTC camera entities** for discovered outdoor stations, backed by HA's bundled go2rtc.
 - **LAN H.264 video + PCMA/G.711 audio** for live intercom streams. Audio is the door-station microphone downlink; two-way talkback is not implemented in this integration yet.
 - **Streaming enabled switch** to explicitly arm live streaming. Intercom video/audio is building-wide exclusive, so streams do not start accidentally from frontend prefetches or HomeKit probes.
@@ -57,12 +57,16 @@ Copy `custom_components/abb_welcome/` into your Home Assistant
 
 Settings → **Devices & Services** → **Add Integration** → **ABB Welcome**.
 
-Fill in four fields:
+Fill in the required fields:
 
 - MyBuildings portal **username**
 - MyBuildings portal **password**
 - Gateway local **IP address**
 - Gateway **web admin password**
+
+Optional: if automatic setup cannot read the gateway UUID from the local
+`portalclient.cgi` endpoint, fill in **Gateway Portal UUID** from the gateway
+web admin Portal page or ABB Welcome mobile app, then retry.
 
 The integration then runs end-to-end without any further interaction:
 
@@ -77,13 +81,13 @@ The integration then runs end-to-end without any further interaction:
    permission flags, and submits the integrity code.
 6. Polls the portal for the gateway's `acl-update` push, decrypts the SIP
    password with the private key, parses the door list, and creates one button
-   entity per outdoor station.
+   entity per unlock-capable outdoor station.
 
 A successful pairing typically completes in under 15 seconds.
 
 ## Entities
 
-For each outdoor station discovered, the integration creates a
+For each unlock-capable outdoor station discovered, the integration creates a
 `button.<gateway>_<door_name>` entity. Press it from the UI or in an automation:
 
 ```yaml
@@ -186,11 +190,16 @@ works with **Fast**, you can leave it there for the lowest-latency setup.
 
 ## Troubleshooting
 
-- **"Cannot reach the gateway"** — Home Assistant must be on the same LAN/VLAN as the gateway, and the gateway IP must be correct. Unlocks use local SIP, while realtime ring detection and live streaming use the gateway's local SIP/TLS listener.
+- **"Cannot reach the gateway web admin on HTTPS port 443"** — Home Assistant
+  cannot open the gateway's local setup interface. Check the IP address and LAN
+  routing first.
 - **"Invalid portal credentials"** — the MyBuildings portal rejected the
   username or password.
 - **"Gateway admin password is wrong"** — the local web admin login at
   `https://<gateway-ip>/` failed. Try logging in manually in a browser to confirm.
+- **"Could not read the gateway's portal UUID"** — some firmware versions return
+  an empty body for `portalclient.cgi op=6` after login. Fill in the optional
+  **Gateway Portal UUID** field and retry; this bypasses that local lookup.
 - **"The gateway did not see our pairing request"** — the connect event didn't
   arrive at the gateway in time. Try again; the gateway may have been busy or
   the portal-to-gateway link briefly down.

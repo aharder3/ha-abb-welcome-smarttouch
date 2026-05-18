@@ -16,6 +16,14 @@ from .coordinator import ABBWelcomeCoordinator
 _LOGGER = logging.getLogger(__name__)
 
 
+def _door_can_unlock(door: dict) -> bool:
+    """Return whether this station should expose a door-open button."""
+    if door.get("can_unlock") is False:
+        return False
+    station_type = str(door.get("type", "")).strip()
+    return not station_type or station_type == "1"
+
+
 def _door_station_key(door: dict) -> str:
     station_id = str(door.get("station_id", "")).strip()
     if station_id:
@@ -47,6 +55,7 @@ async def async_setup_entry(
     entities: list[ButtonEntity] = [
         ABBWelcomeDoorButton(sip_client, door, gateway_uuid, entry.entry_id)
         for door in doors
+        if _door_can_unlock(door)
     ]
     if coordinator is not None and coordinator.has_certs:
         entities.append(ABBWelcomeRefreshButton(coordinator, gateway_uuid))

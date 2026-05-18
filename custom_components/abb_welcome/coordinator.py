@@ -18,6 +18,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
 from .const import DOMAIN
+from .text import repair_utf8_mojibake
 
 _LOGGER = logging.getLogger(__name__)
 _LOG = "[abb] "
@@ -171,7 +172,9 @@ class ABBWelcomeCoordinator(DataUpdateCoordinator[ABBWelcomeData]):
                             payload = json.loads(ie.payload_text)
                             if isinstance(payload, dict):
                                 ie.local_id = str(payload.get("local_id", "")).strip()
-                                ie.local_name = str(payload.get("local_name", "")).strip()
+                                ie.local_name = repair_utf8_mojibake(
+                                    str(payload.get("local_name", "")).strip()
+                                )
                                 if ie.local_id:
                                     ie.station_id = ie.local_id.split("@", 1)[0].removeprefix("sip:")
                     except Exception:

@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from http import HTTPStatus
 from urllib.parse import urljoin
 
@@ -71,6 +72,32 @@ _LOGGER = logging.getLogger(__name__)
 _GO2RTC_DOMAIN = "go2rtc"
 _REQUEST_TIMEOUT = ClientTimeout(total=10)
 _TEARDOWN_GRACE_SECONDS = 2.0
+_DEFAULT_CAMERA_COUNT = 3
+
+
+def _safe_key(value: str) -> str:
+    key = re.sub(r"[^a-z0-9]+", "_", value.lower()).strip("_")
+    return key or "station"
+
+
+def _raw_int(raw: dict, *keys: str) -> int | None:
+    for key in keys:
+        value = raw.get(key)
+        if value is None or value == "":
+            continue
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            continue
+        return parsed if parsed > 0 else None
+    return None
+
+
+def _camera_count_from_raw(raw: dict) -> int:
+    explicit = _raw_int(raw, "camera_count", "sub_camera_count", "cameras")
+    if explicit is not None:
+        return explicit
+    return _DEFAULT_CAMERA_COUNT
 
 
 async def async_setup_entry(
@@ -105,19 +132,42 @@ async def async_setup_entry(
         addr = raw.get("address", "")
         if not addr:
             continue
-        cameras.append(
-            ABBWelcomeCamera(
-                hass=hass,
-                entry_id=entry.entry_id,
-                dialer=dialer,
-                door=Door(
-                    name=raw.get("name") or addr,
-                    address=addr,
-                    station_id=str(raw.get("station_id", "")),
-                ),
-                gateway_uuid=gateway_uuid,
-            )
+        door = Door(
+            name=raw.get("name") or addr,
+            address=addr,
+            station_id=str(raw.get("station_id", "")),
         )
+        camera_count = _camera_count_from_raw(raw)
+        station_type = str(raw.get("type", "")).strip()
+        can_unlock = raw.get("can_unlock")
+        _LOGGER.info(
+            "[abb] camera setup: station name=%s address=%s station_id=%s "
+            "type=%s can_unlock=%s camera_count=%d",
+            door.name, door.address, door.station_id,
+            station_type or "unknown", can_unlock, camera_count,
+        )
+        for camera_index in range(1, camera_count + 1):
+            exposed_index = camera_index if camera_count > 1 else None
+            cameras.append(
+                ABBWelcomeCamera(
+                    hass=hass,
+                    entry_id=entry.entry_id,
+                    dialer=dialer,
+                    door=door,
+                    gateway_uuid=gateway_uuid,
+                    camera_index=exposed_index,
+                    camera_count=camera_count,
+                    station_type=station_type,
+                    can_unlock=can_unlock,
+                )
+            )
+            _LOGGER.info(
+                "[abb] camera setup: added entity door=%s camera_index=%s "
+                "switch_body=%s",
+                door.name,
+                exposed_index if exposed_index is not None else "default",
+                f"d:{exposed_index}" if exposed_index is not None else "none",
+            )
     if cameras:
         async_add_entities(cameras)
 
@@ -153,6 +203,10 @@ class ABBWelcomeCamera(Camera):
         dialer: IntercomDialer,
         door: Door,
         gateway_uuid: str,
+        camera_index: int | None,
+        camera_count: int,
+        station_type: str,
+        can_unlock: bool | str | int | None,
     ) -> None:
         super().__init__()
         self.hass = hass
@@ -160,22 +214,35 @@ class ABBWelcomeCamera(Camera):
         self._dialer = dialer
         self._door = door
         self._gateway_uuid = gateway_uuid
-        self._attr_name = door.name
-        self._attr_unique_id = (
-            f"{gateway_uuid}_camera_{door.station_id or door.address}"
+        self._camera_index = camera_index
+        self._camera_count = camera_count
+        self._station_type = station_type
+        self._can_unlock = can_unlock
+        station_key = _safe_key(door.station_id or door.address)
+        camera_suffix = (
+            f"_cam{camera_index}"
+            if camera_index is not None and camera_index > 1
+            else ""
         )
+        self._attr_name = (
+            f"{door.name} Camera {camera_index}"
+            if camera_index is not None and camera_index > 1
+            else door.name
+        )
+        self._attr_unique_id = f"{gateway_uuid}_camera_{station_key}{camera_suffix}"
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, gateway_uuid)},
             name="ABB Welcome Gateway",
             manufacturer="ABB / Busch-Jaeger",
             model="IP Gateway (MRANGE)",
         )
-        self._stream_name = (
-            f"abb_{(door.station_id or door.address).replace('/', '_').lower()}"
-        )
+        self._stream_name = f"abb_{station_key}{camera_suffix}"
 
         self._session = StreamSession(
-            dialer=dialer, door=door, gateway_host=dialer.host
+            dialer=dialer,
+            door=door,
+            gateway_host=dialer.host,
+            camera_index=camera_index,
         )
         self._rtsp = RtspServer(
             host="127.0.0.1",
@@ -198,14 +265,24 @@ class ABBWelcomeCamera(Camera):
 
     @property
     def extra_state_attributes(self) -> dict[str, str | int | bool]:
-        return {
+        attrs: dict[str, str | int | bool] = {
             "go2rtc_stream": self._stream_name,
             "rtsp_url": self._rtsp.url if self._rtsp.port else "",
             "armed": is_armed(self.hass, self._entry_id),
             "ws_sessions": len(self._ws_clients),
             "rtsp_sessions": self._rtsp.session_count,
             "stream_active": self._session.active,
+            "camera_count": self._camera_count,
+            "camera_interface": self._camera_count > 1,
         }
+        if self._camera_index is not None:
+            attrs["camera_index"] = self._camera_index
+            attrs["camera_switch_body"] = f"d:{self._camera_index}"
+        if self._station_type:
+            attrs["station_type"] = self._station_type
+        if self._can_unlock is not None:
+            attrs["can_unlock"] = self._can_unlock
+        return attrs
 
     # ------------------------------------------------------------------ #
     # entity lifecycle                                                   #
@@ -219,6 +296,13 @@ class ABBWelcomeCamera(Camera):
             self._on_armed_changed,
         )
         await self._rtsp.start()
+        _LOGGER.info(
+            "[abb] camera %s: RTSP server ready url=%s stream=%s "
+            "camera_index=%s camera_count=%d",
+            self._attr_name, self._rtsp.url, self._stream_name,
+            self._camera_index if self._camera_index is not None else "default",
+            self._camera_count,
+        )
         await self._register_with_go2rtc()
 
     async def async_will_remove_from_hass(self) -> None:
@@ -245,8 +329,14 @@ class ABBWelcomeCamera(Camera):
         if not is_armed(self.hass, self._entry_id):
             if self._rtsp.session_count or self._session.active:
                 _LOGGER.info(
-                    "[abb] camera %s: armed flipped off, force-closing",
-                    self._door.name,
+                    "[abb] camera %s: armed flipped off, force-closing "
+                    "camera_index=%s rtsp_sessions=%d active=%s",
+                    self._attr_name,
+                    self._camera_index
+                    if self._camera_index is not None
+                    else "default",
+                    self._rtsp.session_count,
+                    self._session.active,
                 )
                 self.hass.async_create_task(self._force_teardown())
         self.async_write_ha_state()
@@ -293,8 +383,12 @@ class ABBWelcomeCamera(Camera):
                         HTTPStatus.NO_CONTENT,
                     ):
                         _LOGGER.info(
-                            "[abb] camera %s: registered go2rtc stream %s -> %s",
-                            self._door.name, self._stream_name, src,
+                            "[abb] camera %s: registered go2rtc stream %s -> %s "
+                            "camera_index=%s",
+                            self._attr_name, self._stream_name, src,
+                            self._camera_index
+                            if self._camera_index is not None
+                            else "default",
                         )
                         return
             except (ClientError, TimeoutError) as err:
@@ -335,10 +429,22 @@ class ABBWelcomeCamera(Camera):
     # ------------------------------------------------------------------ #
 
     async def _on_rtsp_describe(self) -> str | None:
+        _LOGGER.info(
+            "[abb] camera %s: DESCRIBE armed=%s active=%s rtsp_sessions=%d "
+            "camera_index=%s camera_count=%d switch_body=%s",
+            self._attr_name,
+            is_armed(self.hass, self._entry_id),
+            self._session.active,
+            self._rtsp.session_count,
+            self._camera_index if self._camera_index is not None else "default",
+            self._camera_count,
+            f"d:{self._camera_index}" if self._camera_index is not None else "none",
+        )
         if not is_armed(self.hass, self._entry_id):
             _LOGGER.info(
-                "[abb] camera %s: refusing DESCRIBE (not armed)",
-                self._door.name,
+                "[abb] camera %s: refusing DESCRIBE (not armed) camera_index=%s",
+                self._attr_name,
+                self._camera_index if self._camera_index is not None else "default",
             )
             return None
         async with self._stream_lock:
@@ -347,8 +453,13 @@ class ABBWelcomeCamera(Camera):
                     await self._session.open()
                 except Exception as err:  # noqa: BLE001
                     _LOGGER.exception(
-                        "[abb] camera %s: failed to open stream session: %s",
-                        self._door.name, err,
+                        "[abb] camera %s: failed to open stream session "
+                        "camera_index=%s: %s",
+                        self._attr_name,
+                        self._camera_index
+                        if self._camera_index is not None
+                        else "default",
+                        err,
                     )
                     return None
         codec = self._session.video_codec or "H264/90000"
@@ -379,6 +490,12 @@ class ABBWelcomeCamera(Camera):
             "a=control:trackID=1",
             "",
         ]
+        _LOGGER.info(
+            "[abb] camera %s: DESCRIBE returning SDP codec=%s fmtp=%s "
+            "camera_index=%s",
+            self._attr_name, codec, fmtp,
+            self._camera_index if self._camera_index is not None else "default",
+        )
         return "\r\n".join(sdp_lines) + "\r\n"
 
     async def _on_rtsp_play(self, sess: RtspSession) -> None:
@@ -391,11 +508,22 @@ class ABBWelcomeCamera(Camera):
 
         self._session.set_packet_handlers(on_video=_on_video, on_audio=_on_audio)
         _LOGGER.info(
-            "[abb] camera %s: PLAY started, forwarding RTP to RTSP client",
-            self._door.name,
+            "[abb] camera %s: PLAY started, forwarding RTP to RTSP client "
+            "camera_index=%s rtsp_sessions=%d",
+            self._attr_name,
+            self._camera_index if self._camera_index is not None else "default",
+            self._rtsp.session_count,
         )
 
     async def _on_rtsp_teardown(self, sess: RtspSession) -> None:
+        _LOGGER.info(
+            "[abb] camera %s: TEARDOWN camera_index=%s remaining_sessions=%d "
+            "active=%s",
+            self._attr_name,
+            self._camera_index if self._camera_index is not None else "default",
+            self._rtsp.session_count,
+            self._session.active,
+        )
         if self._rtsp.session_count == 0:
             self._session.set_packet_handlers(on_video=None, on_audio=None)
             self.hass.async_create_task(self._delayed_session_close())
@@ -437,6 +565,15 @@ class ABBWelcomeCamera(Camera):
         session_id: str,
         send_message: WebRTCSendMessage,
     ) -> None:
+        _LOGGER.info(
+            "[abb] camera %s: WebRTC offer session_id=%s armed=%s "
+            "camera_index=%s stream=%s",
+            self._attr_name,
+            session_id,
+            is_armed(self.hass, self._entry_id),
+            self._camera_index if self._camera_index is not None else "default",
+            self._stream_name,
+        )
         if not is_armed(self.hass, self._entry_id):
             send_message(
                 WebRTCError(
@@ -451,6 +588,12 @@ class ABBWelcomeCamera(Camera):
 
         base_url = _go2rtc_url(self.hass)
         if base_url is None:
+            _LOGGER.warning(
+                "[abb] camera %s: WebRTC offer failed, go2rtc unavailable "
+                "camera_index=%s",
+                self._attr_name,
+                self._camera_index if self._camera_index is not None else "default",
+            )
             send_message(
                 WebRTCError(
                     code="go2rtc_unavailable",
@@ -495,6 +638,14 @@ class ABBWelcomeCamera(Camera):
                 Go2RTCOffer(offer_sdp, config.configuration.ice_servers)
             )
         except Exception as err:  # noqa: BLE001
+            _LOGGER.exception(
+                "[abb] camera %s: WebRTC offer forward failed session_id=%s "
+                "camera_index=%s: %s",
+                self._attr_name,
+                session_id,
+                self._camera_index if self._camera_index is not None else "default",
+                err,
+            )
             self._ws_clients.pop(session_id, None)
             try:
                 await ws.close()

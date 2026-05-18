@@ -25,7 +25,6 @@ from .const import (
     CONF_UNLOCK_STRATEGY,
     DEFAULT_UNLOCK_STRATEGY,
     DOMAIN,
-    SIP_PORT,
     UNLOCK_STRATEGIES,
 )
 from .portal import (
@@ -81,9 +80,19 @@ STEP_USER_DATA_SCHEMA = vol.Schema(
 )
 
 
-def _gateway_reachable(host: str, port: int = SIP_PORT, timeout: float = 5) -> bool:
+GATEWAY_WEB_PORT = 443
+
+
+def _gateway_web_reachable(host: str, timeout: float = 5) -> bool:
+    """Return whether the gateway web admin is reachable for setup.
+
+    Pairing talks to the gateway admin CGI over HTTPS. SIP reachability is
+    important after setup, but probing SIP here can mask the real pairing error
+    (for example a broken portalclient.cgi op=6 UUID lookup) with a misleading
+    port-5060 message.
+    """
     try:
-        with socket.create_connection((host, port), timeout=timeout):
+        with socket.create_connection((host, GATEWAY_WEB_PORT), timeout=timeout):
             return True
     except OSError:
         return False
@@ -149,7 +158,7 @@ class ABBWelcomeConfigFlow(ConfigFlow, domain=DOMAIN):
 
             if not errors:
                 reachable = await self.hass.async_add_executor_job(
-                    _gateway_reachable, self._gateway_ip, SIP_PORT
+                    _gateway_web_reachable, self._gateway_ip
                 )
                 if not reachable:
                     errors["base"] = "cannot_connect"
@@ -329,16 +338,20 @@ class ABBWelcomeConfigFlow(ConfigFlow, domain=DOMAIN):
 
         self._sip_password = sip_password
         self._sip_domain = sip_domain
-        self._doors = [
-            {
+        self._doors = []
+        for idx, d in enumerate(doors_meta):
+            door = {
                 "name": d["name"],
                 "address": d["address"],
                 "station_id": d["station_id"],
                 "body": "1",
                 "index": idx,
             }
-            for idx, d in enumerate(doors_meta)
-        ]
+            if d.get("type"):
+                door["type"] = d["type"]
+            if d.get("can_unlock") is False:
+                door["can_unlock"] = False
+            self._doors.append(door)
 
         abort = await self._check_unique(self._gateway_uuid)
         if abort is not None:

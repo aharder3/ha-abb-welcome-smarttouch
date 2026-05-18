@@ -65,6 +65,7 @@ from .const import (
     GATEWAY_CLIENT_TYPE,
     GEO_URL,
 )
+from .text import decode_gateway_text, repair_utf8_mojibake
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -145,7 +146,7 @@ def _http_trace(resp: requests.Response, label: str = "") -> None:
          tag, resp.status_code, resp.reason or "", len(resp.content))
     _log(logging.DEBUG, "%s<< resp headers: %s", tag, dict(resp.headers))
     try:
-        resp_text = resp.text
+        resp_text = decode_gateway_text(resp.content)
     except Exception as err:  # noqa: BLE001
         resp_text = f"<undecodable: {err}>"
     _log(logging.DEBUG, "%s<< resp body: %s",
@@ -370,7 +371,9 @@ def discover_gateway(
 
         for uid, info in entries.items():
             if info.get("type") == GATEWAY_CLIENT_TYPE:
-                return uid, info.get("name", "ABB Welcome Gateway")
+                return uid, repair_utf8_mojibake(
+                    str(info.get("name") or "ABB Welcome Gateway")
+                )
         raise PortalError(
             "Discovery event has no gateway entry "
             f"(type={GATEWAY_CLIENT_TYPE} not found)"
@@ -470,7 +473,7 @@ def poll_acl_update(
                         "ACL-update arrived (event id=%s, %d-byte payload) on attempt %d",
                         evt.get("id"), len(raw), n,
                     )
-                    return raw.decode("utf-8", errors="replace")
+                    return decode_gateway_text(raw)
             time.sleep(interval)
         _log(logging.WARNING, "ACL-update polling timed out after %d attempts", attempts)
         return None
@@ -481,11 +484,11 @@ def poll_acl_update(
 
 def parse_acl_update(
     payload: str, private_key_pem: bytes
-) -> tuple[str, str, list[dict[str, str]]]:
+) -> tuple[str, str, list[dict[str, Any]]]:
     """Decode an ACL-update payload.
 
-    Returns ``(sip_password, sip_domain, doors)`` where each door is
-    ``{"name", "address", "station_id"}``.
+    Returns ``(sip_password, sip_domain, doors)`` where each door includes
+    ``name``, ``address``, ``station_id``, and optional station metadata.
     """
     _log(logging.INFO, "Parsing ACL-update payload (%d bytes)", len(payload))
     lines = payload.splitlines()
@@ -517,7 +520,7 @@ def parse_acl_update(
         else ""
     )
 
-    doors: list[dict[str, str]] = []
+    doors: list[dict[str, Any]] = []
     for sec in config.sections():
         if not sec.startswith("outdoorstation_"):
             continue
@@ -527,13 +530,17 @@ def parse_acl_update(
         station_id = (
             address.split(":", 1)[-1].split("@", 1)[0] if ":" in address else ""
         )
-        doors.append(
-            {
-                "name": config.get(sec, "name", fallback=sec),
-                "address": address,
-                "station_id": station_id,
-            }
-        )
+        station_type = config.get(sec, "type", fallback="").strip()
+        door: dict[str, Any] = {
+            "name": repair_utf8_mojibake(config.get(sec, "name", fallback=sec)),
+            "address": address,
+            "station_id": station_id,
+        }
+        if station_type:
+            door["type"] = station_type
+            if station_type != "1":
+                door["can_unlock"] = False
+        doors.append(door)
 
     _log(logging.INFO, "ACL-update parsed: sip_domain=%s, %d door(s)", sip_domain, len(doors))
     for d in doors:
@@ -633,15 +640,16 @@ def _gw_post(
         _http_trace(resp, f"gw{path}?op={op_label}[{variant}]")
         if resp.status_code != 200:
             raise GatewayAdminError(
-                f"{path} returned HTTP {resp.status_code}: {resp.text[:200]}"
+                f"{path} returned HTTP {resp.status_code}: "
+                f"{decode_gateway_text(resp.content)[:200]}"
             )
 
-        text = resp.text.strip()
+        text = decode_gateway_text(resp.content).strip()
         if not text:
             parsed: dict = {}
         else:
             try:
-                parsed = resp.json()
+                parsed = _json.loads(text)
             except ValueError:
                 # Some endpoints return a bare scalar like "1" or "FALSE".
                 parsed = {"_raw": text}
@@ -697,7 +705,7 @@ def _gateway_login(
         verify=False,
     )
     _http_trace(resp, "checklogin")
-    body = resp.text.strip()
+    body = decode_gateway_text(resp.content).strip()
     _log(logging.DEBUG, "Gateway login response: HTTP %d body=%r", resp.status_code, body)
     if resp.status_code != 200 or body not in ("1", "2"):
         session.close()
@@ -737,6 +745,8 @@ def gateway_local_info(
     try:
         info = _gw_post(session, gateway_ip, "/cgi-bin/portalclient.cgi", {"op": "6"})
         _log(logging.INFO, "Gateway op=6 returned: %s", info)
+        if isinstance(info.get("portalname"), str):
+            info = {**info, "portalname": repair_utf8_mojibake(info["portalname"])}
         if "uuid" not in info:
             raise GatewayAdminError(
                 f"Gateway op=6 response missing uuid: {info!r}"

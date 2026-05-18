@@ -156,12 +156,14 @@ class StreamSession:
         dialer: IntercomDialer,
         door: Door,
         gateway_host: str,
+        camera_index: int | None = None,
         on_video_packet: Callable[[bytes], None] | None = None,
         on_audio_packet: Callable[[bytes], None] | None = None,
     ) -> None:
         self._dialer = dialer
         self._door = door
         self._gateway_host = gateway_host
+        self._camera_index = camera_index
         self._on_video_packet = on_video_packet
         self._on_audio_packet = on_audio_packet
 
@@ -215,9 +217,10 @@ class StreamSession:
 
         _LOGGER.info(
             "[abb] media: dialing gateway for door=%s media_ip=%s "
-            "audio_port=%d video_port=%d",
+            "audio_port=%d video_port=%d camera_index=%s",
             self._door.name, self._media_ip,
             offer_audio_port, offer_video_port,
+            self._camera_index if self._camera_index is not None else "default",
         )
 
         call = await self._dialer.dial(
@@ -226,11 +229,45 @@ class StreamSession:
             video_port=offer_video_port,
         )
         self._call = call
+        if self._camera_index is not None:
+            switch_body = f"d:{self._camera_index}"
+            _LOGGER.info(
+                "[abb] media: selecting camera index %d for door=%s "
+                "call_id=%s body=%r",
+                self._camera_index, self._door.name, call.call_id, switch_body,
+            )
+            try:
+                response = await self._dialer.send_active_message(
+                    switch_body, timeout=3.0
+                )
+                if response is None:
+                    _LOGGER.warning(
+                        "[abb] media: camera index %d switch timed out for "
+                        "door=%s call_id=%s; continuing stream so logs show RTP",
+                        self._camera_index, self._door.name, call.call_id,
+                    )
+                else:
+                    _LOGGER.info(
+                        "[abb] media: camera index %d switch accepted for "
+                        "door=%s call_id=%s response=%s",
+                        self._camera_index, self._door.name, call.call_id,
+                        response.start_line,
+                    )
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.exception(
+                    "[abb] media: camera index %d switch failed for door=%s "
+                    "call_id=%s body=%r; continuing default video: %s",
+                    self._camera_index, self._door.name, call.call_id,
+                    switch_body, err,
+                )
 
         for m in call.answer.medias:
             _LOGGER.info(
-                "[abb] media: %s SDP answer media=%s ip=%s port=%d pts=%s rtpmap=%s direction=%s",
-                self._door.name, m.media, m.connection_ip, m.port,
+                "[abb] media: %s SDP answer camera_index=%s media=%s ip=%s "
+                "port=%d pts=%s rtpmap=%s direction=%s",
+                self._door.name,
+                self._camera_index if self._camera_index is not None else "default",
+                m.media, m.connection_ip, m.port,
                 m.payload_types, m.rtpmap, m.direction,
             )
             if m.media == "audio" and m.connection_ip and m.port:
@@ -250,8 +287,11 @@ class StreamSession:
 
         def _video_first(data: bytes) -> None:
             _LOGGER.info(
-                "[abb] media: first video RTP packet for %s (%d bytes)",
-                self._door.name, len(data),
+                "[abb] media: first video RTP packet for %s camera_index=%s "
+                "(%d bytes)",
+                self._door.name,
+                self._camera_index if self._camera_index is not None else "default",
+                len(data),
             )
             if self._endpoints.video and self._video_transport:
                 ssrc = (
@@ -321,8 +361,9 @@ class StreamSession:
     async def close(self) -> None:
         _LOGGER.info(
             "[abb] media: closing stream for %s "
-            "(video_pkts=%d audio_pkts=%d rewrites=%d)",
+            "camera_index=%s (video_pkts=%d audio_pkts=%d rewrites=%d)",
             self._door.name,
+            self._camera_index if self._camera_index is not None else "default",
             self._video_proto.packets if self._video_proto else 0,
             self._audio_proto.packets if self._audio_proto else 0,
             self._video_proto._rewrites if self._video_proto else 0,
@@ -424,9 +465,10 @@ class StreamSession:
             vp = self._video_proto
             ap = self._audio_proto
             _LOGGER.info(
-                "[abb] media stats %s: video pkts=%d pts=%s rewrites=%d "
-                "audio pkts=%d",
+                "[abb] media stats %s camera_index=%s: video pkts=%d pts=%s "
+                "rewrites=%d audio pkts=%d",
                 self._door.name,
+                self._camera_index if self._camera_index is not None else "default",
                 vp.packets if vp else 0,
                 dict(vp.payload_types) if vp else {},
                 vp._rewrites if vp else 0,

@@ -22,7 +22,7 @@
       }
     },
     "error": {
-      "cannot_connect": "Cannot reach the gateway on port 5060. Check the IP and that you are on the same network.",
+      "cannot_connect": "Cannot reach the gateway web admin on HTTPS port 443. Check the IP address and that Home Assistant is on the same network.",
       "invalid_auth": "Invalid portal credentials.",
       "gateway_not_found": "No IP gateway is visible to this portal account.",
       "gateway_admin_auth_failed": "Gateway admin password is wrong (login at https://gateway-ip/ as `admin` failed).",

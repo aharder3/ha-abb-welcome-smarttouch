@@ -19,6 +19,7 @@ from .coordinator import ABBWelcomeCoordinator
 from .sip_client import SIPClient
 from .sip_listener import IncomingCall, SipListener
 from .streaming_state import ARM_REASON_RING, RING_ARM_SECONDS, arm
+from .text import decode_gateway_text, repair_utf8_mojibake
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -59,6 +60,7 @@ PLATFORMS = [
 ]
 
 POLL_INTERVAL = timedelta(seconds=30)
+PRESERVED_DOOR_METADATA_KEYS = ("type", "can_unlock")
 
 # Bus event fired on every incoming SIP INVITE.  Carries the caller URI,
 # extracted user portion (typically the outdoor station id), and call_id.
@@ -89,6 +91,9 @@ def _build_client(entry: ConfigEntry) -> SIPClient:
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up ABB Welcome from a config entry."""
+    # Repair names persisted by older versions before entities are created.
+    _repair_entry_door_names(hass, entry)
+
     # Refresh the door topology before entities are created.  This makes a
     # normal config-entry reload pick up outdoor stations added/removed via
     # the gateway admin UI, without re-running the pairing/config flow.
@@ -244,7 +249,7 @@ def _fetch_gateway_device_list(gateway_ip: str, admin_password: str) -> str:
                     timeout=_GATEWAY_ADMIN_TIMEOUT,
                     verify=False,
                 )
-                body = login.text.strip()
+                body = decode_gateway_text(login.content).strip()
                 if (
                     login.status_code != 200
                     or body not in _GATEWAY_LOGIN_OK_RESPONSES
@@ -268,7 +273,7 @@ def _fetch_gateway_device_list(gateway_ip: str, admin_password: str) -> str:
                         f"{response.status_code}"
                     )
                     continue
-                return response.text.strip()
+                return decode_gateway_text(response.content).strip()
         except requests.RequestException as err:
             errors.append(f"{scheme}: {err}")
 
@@ -284,7 +289,7 @@ def _parse_gateway_doors(raw: str, sip_domain: str) -> list[dict]:
             continue
 
         device_id = parts[1].strip()
-        name = unquote(parts[2].strip())
+        name = repair_utf8_mojibake(unquote(parts[2].strip()))
         if not device_id or not name:
             continue
 
@@ -324,10 +329,32 @@ def _fetch_doors_from_gateway(
 
 def _doors_equal(a: list[dict], b: list[dict]) -> bool:
     """Compare door lists ignoring persisted index metadata."""
-    keys = ("name", "address", "station_id", "body")
+    keys = ("name", "address", "station_id", "body", "type", "can_unlock")
     return [tuple(door.get(key) for key in keys) for door in a] == [
         tuple(door.get(key) for key in keys) for door in b
     ]
+
+
+def _repair_entry_door_names(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Repair mojibake in door names stored by older config-flow versions."""
+    current = entry.data.get("doors", []) or []
+    repaired: list[dict] = []
+    changed = False
+    for door in current:
+        name = door.get("name")
+        if isinstance(name, str):
+            repaired_name = repair_utf8_mojibake(name)
+            if repaired_name != name:
+                door = {**door, "name": repaired_name}
+                changed = True
+        repaired.append(door)
+
+    if changed:
+        _LOGGER.info("[abb] repaired UTF-8 mojibake in stored door names")
+        hass.config_entries.async_update_entry(
+            entry, data={**entry.data, "doors": repaired}
+        )
+    return changed
 
 
 async def _async_refresh_doors_for_entry(
@@ -355,6 +382,19 @@ async def _async_refresh_doors_for_entry(
         return False
 
     current = entry.data.get("doors", []) or []
+    current_by_station = {
+        str(door.get("station_id", "")).strip(): door
+        for door in current
+        if str(door.get("station_id", "")).strip()
+    }
+    for door in new_doors:
+        old = current_by_station.get(str(door.get("station_id", "")).strip())
+        if old is None:
+            continue
+        for key in PRESERVED_DOOR_METADATA_KEYS:
+            if key in old and key not in door:
+                door[key] = old[key]
+
     if _doors_equal(current, new_doors):
         _LOGGER.info(
             "[abb] refresh_doors: entry %s already up to date (%d door(s))",
