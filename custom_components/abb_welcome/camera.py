@@ -72,7 +72,6 @@ _LOGGER = logging.getLogger(__name__)
 _GO2RTC_DOMAIN = "go2rtc"
 _REQUEST_TIMEOUT = ClientTimeout(total=10)
 _TEARDOWN_GRACE_SECONDS = 2.0
-_DEFAULT_CAMERA_COUNT = 3
 
 
 def _safe_key(value: str) -> str:
@@ -97,7 +96,11 @@ def _camera_count_from_raw(raw: dict) -> int:
     explicit = _raw_int(raw, "camera_count", "sub_camera_count", "cameras")
     if explicit is not None:
         return explicit
-    return _DEFAULT_CAMERA_COUNT
+    return 1
+
+
+def _door_key(door: Door) -> str:
+    return _safe_key(door.station_id or door.address)
 
 
 async def async_setup_entry(
@@ -114,8 +117,93 @@ async def async_setup_entry(
     if not (sip_user and sip_pass and sip_domain and gw_ip and raw_doors):
         return
 
+    gateway_uuid = entry.data.get("gateway_uuid", "unknown")
+    door_meta: dict[str, tuple[Door, str, bool | str | int | None]] = {}
+    camera_entities: dict[tuple[str, int], ABBWelcomeCamera] = {}
+    created_indexes: dict[str, set[int]] = {}
+    detected_counts: dict[str, int] = {}
+
+    def _build_camera(
+        door: Door,
+        *,
+        camera_index: int,
+        camera_count: int,
+        station_type: str,
+        can_unlock: bool | str | int | None,
+    ) -> ABBWelcomeCamera:
+        exposed_index = camera_index if camera_index > 1 else None
+        camera = ABBWelcomeCamera(
+            hass=hass,
+            entry_id=entry.entry_id,
+            dialer=dialer,
+            door=door,
+            gateway_uuid=gateway_uuid,
+            camera_index=exposed_index,
+            camera_count=camera_count,
+            station_type=station_type,
+            can_unlock=can_unlock,
+        )
+        key = _door_key(door)
+        camera_entities[(key, camera_index)] = camera
+        created_indexes.setdefault(key, set()).add(camera_index)
+        return camera
+
+    def _on_camera_count_detected(door: Door, count: int, body: str) -> None:
+        if count < 1:
+            return
+        key = _door_key(door)
+        meta = door_meta.get(key)
+        if meta is None:
+            _LOGGER.info(
+                "[abb] camera setup: detected camera count=%d for unknown "
+                "door=%s body=%r",
+                count, door.name, body[:200],
+            )
+            return
+
+        stored_door, station_type, can_unlock = meta
+        previous_count = detected_counts.get(key, 1)
+        detected_counts[key] = max(previous_count, count)
+        for index in created_indexes.get(key, set()):
+            entity = camera_entities.get((key, index))
+            if entity is not None:
+                entity.set_camera_count(detected_counts[key])
+
+        new_cameras: list[Camera] = []
+        for camera_index in range(2, count + 1):
+            if camera_index in created_indexes.get(key, set()):
+                continue
+            new_cameras.append(
+                _build_camera(
+                    stored_door,
+                    camera_index=camera_index,
+                    camera_count=count,
+                    station_type=station_type,
+                    can_unlock=can_unlock,
+                )
+            )
+
+        if not new_cameras:
+            _LOGGER.info(
+                "[abb] camera setup: camera count=%d for door=%s produced no "
+                "new entities (already have indexes=%s)",
+                count, stored_door.name, sorted(created_indexes.get(key, set())),
+            )
+            return
+
+        _LOGGER.info(
+            "[abb] camera setup: adding %d detected sub-camera entity(s) for "
+            "door=%s count=%d source_body=%r",
+            len(new_cameras), stored_door.name, count, body[:200],
+        )
+        async_add_entities(new_cameras)
+
     dialer = IntercomDialer(
-        host=gw_ip, username=sip_user, password=sip_pass, domain=sip_domain
+        host=gw_ip,
+        username=sip_user,
+        password=sip_pass,
+        domain=sip_domain,
+        on_camera_count=_on_camera_count_detected,
     )
     data["intercom_dialer"] = dialer
 
@@ -124,7 +212,6 @@ async def async_setup_entry(
 
     entry.async_on_unload(_close_dialer)
 
-    gateway_uuid = entry.data.get("gateway_uuid", "unknown")
     cameras: list[Camera] = []
     for raw in raw_doors:
         if not isinstance(raw, dict):
@@ -140,22 +227,20 @@ async def async_setup_entry(
         camera_count = _camera_count_from_raw(raw)
         station_type = str(raw.get("type", "")).strip()
         can_unlock = raw.get("can_unlock")
+        key = _door_key(door)
+        door_meta[key] = (door, station_type, can_unlock)
+        detected_counts[key] = camera_count
         _LOGGER.info(
             "[abb] camera setup: station name=%s address=%s station_id=%s "
-            "type=%s can_unlock=%s camera_count=%d",
+            "type=%s can_unlock=%s initial_camera_count=%d",
             door.name, door.address, door.station_id,
             station_type or "unknown", can_unlock, camera_count,
         )
         for camera_index in range(1, camera_count + 1):
-            exposed_index = camera_index if camera_count > 1 else None
             cameras.append(
-                ABBWelcomeCamera(
-                    hass=hass,
-                    entry_id=entry.entry_id,
-                    dialer=dialer,
+                _build_camera(
                     door=door,
-                    gateway_uuid=gateway_uuid,
-                    camera_index=exposed_index,
+                    camera_index=camera_index,
                     camera_count=camera_count,
                     station_type=station_type,
                     can_unlock=can_unlock,
@@ -165,8 +250,8 @@ async def async_setup_entry(
                 "[abb] camera setup: added entity door=%s camera_index=%s "
                 "switch_body=%s",
                 door.name,
-                exposed_index if exposed_index is not None else "default",
-                f"d:{exposed_index}" if exposed_index is not None else "none",
+                camera_index if camera_index > 1 else "default",
+                f"d:{camera_index}" if camera_index > 1 else "none",
             )
     if cameras:
         async_add_entities(cameras)
@@ -258,6 +343,16 @@ class ABBWelcomeCamera(Camera):
 
         self._stream_lock = asyncio.Lock()
         self._unsub_armed: callable | None = None
+
+    def set_camera_count(self, count: int) -> None:
+        if count <= self._camera_count:
+            return
+        self._camera_count = count
+        _LOGGER.info(
+            "[abb] camera %s: updated detected camera_count=%d",
+            self._attr_name, count,
+        )
+        self.async_write_ha_state()
 
     @property
     def camera_capabilities(self) -> CameraCapabilities:

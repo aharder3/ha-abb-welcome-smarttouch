@@ -30,6 +30,7 @@ _LOGGER = logging.getLogger(__name__)
 
 USER_AGENT = "LinphoneAndroid/3.10.9"
 DEFAULT_REGISTER_EXPIRES = 600
+_CAMERA_COUNT_RE = re.compile(r"(?:^|[\s;,])c:(\d+)(?:$|[\s;,])")
 
 
 @dataclass
@@ -295,12 +296,14 @@ class IntercomDialer:
         password: str,
         domain: str,
         port: int = 5061,
+        on_camera_count: Callable[[Door, int, str], None] | None = None,
     ) -> None:
         self.host = host
         self.username = username
         self.password = password
         self.domain = domain
         self.port = port
+        self._on_camera_count = on_camera_count
 
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
@@ -426,6 +429,7 @@ class IntercomDialer:
                                 frame.header("To"),
                                 body[:200],
                             )
+                            self._handle_camera_count_message(frame, body)
                         await self._send_response(frame, 200, "OK")
                         continue
                     if frame.method == "BYE":
@@ -449,6 +453,32 @@ class IntercomDialer:
             return
         except Exception as err:  # noqa: BLE001
             _LOGGER.warning("dialer reader exited: %s", err)
+
+    def _handle_camera_count_message(self, frame: SipFrame, body: str) -> None:
+        match = _CAMERA_COUNT_RE.search(body.strip())
+        if match is None:
+            return
+        callback = self._on_camera_count
+        call = self._call
+        if callback is None or call is None:
+            return
+        if frame.header("Call-ID") != call.call_id:
+            _LOGGER.info(
+                "[abb] dialer: ignoring camera count MESSAGE for non-active "
+                "call call_id=%s active_call_id=%s body=%r",
+                frame.header("Call-ID"), call.call_id, body[:200],
+            )
+            return
+        count = int(match.group(1))
+        _LOGGER.info(
+            "[abb] dialer: detected camera count=%d for door=%s call_id=%s "
+            "from MESSAGE body=%r",
+            count, call.door.name, call.call_id, body[:200],
+        )
+        try:
+            callback(call.door, count, body)
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.debug("[abb] dialer: camera count callback failed: %s", err)
 
     async def _await_response(
         self, predicate: Callable[[SipFrame], bool], timeout: float
