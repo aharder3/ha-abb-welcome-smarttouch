@@ -206,7 +206,18 @@ async def async_setup_entry(
 
     def _on_camera_count_detected(door: Door, count: int, body: str) -> None:
         _on_camera_count_for_key(
-            _door_key(door), count, body, source="intercom_dialer", fallback_name=door.name
+            _door_key(door),
+            count,
+            body,
+            source="intercom_dialer",
+            fallback_name=door.name,
+        )
+
+    def _on_listener_camera_count_for_door(
+        door: Door, count: int, body: str, source: str = "sip_listener"
+    ) -> None:
+        _on_camera_count_for_key(
+            _door_key(door), count, body, source=source, fallback_name=door.name
         )
 
     def _on_listener_camera_count(
@@ -216,6 +227,7 @@ async def async_setup_entry(
             _safe_key(station_id), count, body, source=source, fallback_name=station_id
         )
 
+    data["camera_count_door_handler"] = _on_listener_camera_count_for_door
     data["camera_count_handler"] = _on_listener_camera_count
 
     dialer = IntercomDialer(

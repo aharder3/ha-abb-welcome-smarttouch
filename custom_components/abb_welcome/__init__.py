@@ -199,31 +199,78 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             match = _CAMERA_COUNT_MESSAGE_RE.search(body)
             if match is None:
                 return
-            headers = payload.get("headers") if isinstance(payload.get("headers"), dict) else {}
-            station_id = _station_id_from_sip_value(_header_value(headers, "From"))
+            headers = (
+                payload.get("headers")
+                if isinstance(payload.get("headers"), dict)
+                else {}
+            )
+            count = int(match.group(1))
+            call_id = _header_value(headers, "Call-ID")
+            from_station_id = _station_id_from_sip_value(_header_value(headers, "From"))
+
+            # ABB Camera Interface units can send the `c:N` notification via
+            # a fixed gateway/root sender (often station 100000001), not the
+            # actual station being viewed.  Prefer the active/pending
+            # surveillance target owned by IntercomDialer; fall back to
+            # From/request URI only when there is no call context available.
+            dialer = entry_data.get("intercom_dialer")
+            call_target = getattr(dialer, "camera_count_target", None)
+            door_handler = entry_data.get("camera_count_door_handler")
+            if call_target is not None and callable(door_handler):
+                target_door = call_target.door
+                if call_id and call_id != call_target.call_id:
+                    _LOGGER.info(
+                        "[abb] sip_listener: camera count MESSAGE call_id=%s "
+                        "does not match target_call_id=%s; using target "
+                        "door=%s station=%s instead of sender=%s",
+                        call_id,
+                        call_target.call_id,
+                        target_door.name,
+                        target_door.station_id,
+                        from_station_id or "unknown",
+                    )
+                _LOGGER.info(
+                    "[abb] sip_listener: detected camera count=%d for target "
+                    "door=%s station=%s sender=%s call_id=%s body=%r",
+                    count,
+                    target_door.name,
+                    target_door.station_id,
+                    from_station_id or "unknown",
+                    call_id or "unknown",
+                    body[:200],
+                )
+                door_handler(target_door, count, body, "sip_listener_call_target")
+                return
+
+            station_id = from_station_id
             if not station_id:
                 station_id = _station_id_from_sip_value(str(payload.get("request_uri") or ""))
             if not station_id:
                 _LOGGER.info(
                     "[abb] sip_listener: camera count MESSAGE body=%r has no "
-                    "station id (from=%r request_uri=%r)",
-                    body[:200], _header_value(headers, "From"), payload.get("request_uri"),
+                    "station id and no active call (from=%r request_uri=%r)",
+                    body[:200],
+                    _header_value(headers, "From"),
+                    payload.get("request_uri"),
                 )
                 return
             handler = entry_data.get("camera_count_handler")
             if not callable(handler):
                 _LOGGER.info(
-                    "[abb] sip_listener: camera count=%s for station=%s but "
+                    "[abb] sip_listener: camera count=%d for station=%s but "
                     "camera handler is not ready",
-                    match.group(1), station_id,
+                    count,
+                    station_id,
                 )
                 return
             _LOGGER.info(
-                "[abb] sip_listener: detected camera count=%s for station=%s "
-                "from MESSAGE body=%r",
-                match.group(1), station_id, body[:200],
+                "[abb] sip_listener: detected camera count=%d for station=%s "
+                "from MESSAGE body=%r using sender fallback",
+                count,
+                station_id,
+                body[:200],
             )
-            handler(station_id, int(match.group(1)), body, "sip_listener")
+            handler(station_id, count, body, "sip_listener_sender_fallback")
 
         def _on_state_change(new_state: str) -> None:
             hass.bus.async_fire(

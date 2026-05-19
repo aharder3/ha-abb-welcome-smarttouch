@@ -216,6 +216,13 @@ class Door:
 
 
 @dataclass
+class CallTarget:
+    door: Door
+    call_id: str
+    created_at: float
+
+
+@dataclass
 class CallState:
     door: Door
     call_id: str
@@ -312,6 +319,7 @@ class IntercomDialer:
         self._media_ip: str = ""
         self._cseq: int = 0
         self._call: CallState | None = None
+        self._pending_camera_count_target: CallTarget | None = None
         self._registered = False
         self._reader_task: asyncio.Task | None = None
         self._inbound_queue: asyncio.Queue[SipFrame] = asyncio.Queue()
@@ -324,6 +332,28 @@ class IntercomDialer:
     @property
     def in_call(self) -> bool:
         return self._call is not None
+
+    @property
+    def active_call(self) -> CallState | None:
+        """Return the current established surveillance call, if any."""
+        return self._call
+
+    @property
+    def camera_count_target(self) -> CallState | CallTarget | None:
+        """Return the call target that should receive a camera-count notice.
+
+        ABB can send `c:N` before the INVITE reaches 200 OK, so `_call` may
+        not exist yet.  During that short window, use the pending INVITE target.
+        """
+        if self._call is not None:
+            return self._call
+        target = self._pending_camera_count_target
+        if target is None:
+            return None
+        if time.monotonic() - target.created_at > 30:
+            self._pending_camera_count_target = None
+            return None
+        return target
 
     def _connection_is_usable_locked(self) -> bool:
         if self._writer is None or not self._registered:
@@ -342,6 +372,7 @@ class IntercomDialer:
         self._reader_task = None
         self._registered = False
         self._call = None
+        self._pending_camera_count_target = None
         while True:
             try:
                 self._inbound_queue.get_nowait()
@@ -440,6 +471,7 @@ class IntercomDialer:
                         )
                         await self._send_response(frame, 200, "OK")
                         self._call = None
+                        self._pending_camera_count_target = None
                         continue
                 elif _LOGGER.isEnabledFor(logging.DEBUG):
                     _LOGGER.debug(
@@ -642,6 +674,9 @@ class IntercomDialer:
         from_header = f"<sip:{self.username}@{self.domain};transport=tls>"
         to_header = f"<{request_uri}>"
         local_contact = f"<sip:{self.username}@{self._local_ip}:{self._local_port};transport=tls>"
+        self._pending_camera_count_target = CallTarget(
+            door=door, call_id=call_id, created_at=time.monotonic()
+        )
 
         sdp = _build_offer_sdp(self.media_ip, audio_port, video_port, self.username)
         invite_cseq = self._cseq
@@ -691,6 +726,7 @@ class IntercomDialer:
             )
 
         if frame.status_code != 200:
+            self._pending_camera_count_target = None
             raise RuntimeError(f"INVITE rejected: {frame.start_line}")
 
         remote_to = frame.header("To")
@@ -731,9 +767,11 @@ class IntercomDialer:
                 video_local_port=video_port,
                 answer=answer,
             )
+            self._pending_camera_count_target = None
             self._cseq += 1
             return self._call
         except Exception as err:
+            self._pending_camera_count_target = None
             _LOGGER.error("post-2xx setup failed (%s); sending best-effort BYE", err)
             await self._best_effort_bye(
                 request_uri, remote_contact, call_id, local_tag,
@@ -827,6 +865,7 @@ class IntercomDialer:
         except asyncio.TimeoutError:
             pass
         self._call = None
+        self._pending_camera_count_target = None
 
     async def send_active_message(
         self, body: str, *, timeout: float = 5.0
@@ -866,35 +905,87 @@ class IntercomDialer:
                 f"User-Agent: {USER_AGENT}",
                 "Content-Type: text/plain",
             ]
+
+            def _matches_message_response(expected_cseq: int):
+                def _predicate(frame: SipFrame) -> bool:
+                    cseq_header = frame.header("CSeq")
+                    cseq_number = cseq_header.split(" ", 1)[0]
+                    return (
+                        frame.is_response
+                        and cseq_header.upper().endswith(" MESSAGE")
+                        and cseq_number == str(expected_cseq)
+                        and frame.header("Call-ID") == call.call_id
+                    )
+
+                return _predicate
+
+            async def _wait_message_response(expected_cseq: int) -> SipFrame | None:
+                try:
+                    response = await self._await_response(
+                        _matches_message_response(expected_cseq), timeout=timeout
+                    )
+                except asyncio.TimeoutError:
+                    _LOGGER.warning(
+                        "[abb] dialer: no SIP MESSAGE response within %.1fs "
+                        "call_id=%s cseq=%d body=%r",
+                        timeout, call.call_id, expected_cseq, body,
+                    )
+                    return None
+
+                while response.is_response and 100 <= (response.status_code or 0) < 200:
+                    response = await self._await_response(
+                        _matches_message_response(expected_cseq), timeout=timeout
+                    )
+                return response
+
             await self._send_request("MESSAGE", target, headers, body)
             self._cseq += 1
-
-            try:
-                frame = await self._await_response(
-                    lambda f: (
-                        f.is_response
-                        and f.header("CSeq").endswith("MESSAGE")
-                        and f.header("Call-ID") == call.call_id
-                    ),
-                    timeout=timeout,
-                )
-            except asyncio.TimeoutError:
-                _LOGGER.warning(
-                    "[abb] dialer: no SIP MESSAGE response within %.1fs "
-                    "call_id=%s cseq=%d body=%r",
-                    timeout, call.call_id, cseq, body,
-                )
+            frame = await _wait_message_response(cseq)
+            if frame is None:
                 return None
 
-            while frame.is_response and 100 <= (frame.status_code or 0) < 200:
-                frame = await self._await_response(
-                    lambda f: (
-                        f.is_response
-                        and f.header("CSeq").endswith("MESSAGE")
-                        and f.header("Call-ID") == call.call_id
-                    ),
-                    timeout=timeout,
+            if frame.status_code in (401, 407):
+                challenge_hdr = (
+                    "Proxy-Authenticate"
+                    if frame.status_code == 407
+                    else "WWW-Authenticate"
                 )
+                auth_hdr = (
+                    "Proxy-Authorization"
+                    if frame.status_code == 407
+                    else "Authorization"
+                )
+                challenge = _parse_challenge(frame.header(challenge_hdr))
+                if not challenge:
+                    raise RuntimeError(
+                        f"MESSAGE auth challenge missing: {frame.start_line}"
+                    )
+                cseq = self._cseq
+                new_branch = "z9hG4bK-" + uuid.uuid4().hex[:12]
+                auth = _digest(
+                    self.username, self.password, "MESSAGE", target, challenge
+                )
+                headers = [
+                    h for h in headers
+                    if not h.startswith("Authorization:")
+                    and not h.startswith("Proxy-Authorization:")
+                ]
+                headers[0] = (
+                    f"Via: SIP/2.0/TLS {self._local_ip}:{self._local_port};"
+                    f"branch={new_branch};rport"
+                )
+                headers[5] = f"CSeq: {cseq} MESSAGE"
+                headers.append(f"{auth_hdr}: {auth}")
+                _LOGGER.info(
+                    "[abb] dialer: retrying SIP MESSAGE with %s after %s "
+                    "call_id=%s cseq=%d body=%r",
+                    auth_hdr, frame.start_line, call.call_id, cseq, body,
+                )
+                await self._send_request("MESSAGE", target, headers, body)
+                self._cseq += 1
+                frame = await _wait_message_response(cseq)
+                if frame is None:
+                    return None
 
             _LOGGER.info(
                 "[abb] dialer: SIP MESSAGE response %s call_id=%s cseq=%s body=%r",
