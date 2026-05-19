@@ -2,6 +2,7 @@
 
 import json
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import unquote
@@ -26,6 +27,24 @@ _LOGGER = logging.getLogger(__name__)
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _header_value(headers: dict, name: str) -> str:
+    """Return a SIP header value from sip_listener's JSON-safe summary."""
+    wanted = name.lower()
+    for key, value in headers.items():
+        if key.lower() != wanted:
+            continue
+        if isinstance(value, list):
+            return str(value[0]) if value else ""
+        return str(value)
+    return ""
+
+
+def _station_id_from_sip_value(value: str) -> str:
+    """Extract the SIP user/station id from a URI-bearing header value."""
+    match = _SIP_URI_USER_RE.search(value or "")
+    return match.group(1).strip() if match else ""
 
 
 for _name in (
@@ -61,6 +80,8 @@ PLATFORMS = [
 
 POLL_INTERVAL = timedelta(seconds=30)
 PRESERVED_DOOR_METADATA_KEYS = ("type", "can_unlock")
+_CAMERA_COUNT_MESSAGE_RE = re.compile(r"(?:^|[\s;,])c:(\d+)(?:$|[\s;,])")
+_SIP_URI_USER_RE = re.compile(r"sip:([^@;>]+)")
 
 # Bus event fired on every incoming SIP INVITE.  Carries the caller URI,
 # extracted user portion (typically the outdoor station id), and call_id.
@@ -171,6 +192,38 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     and payload.get("method") == "INVITE"
                 )
                 sensor.record_frame(payload.get("direction", ""), is_invite)
+
+            if payload.get("direction") != "in" or payload.get("method") != "MESSAGE":
+                return
+            body = str(payload.get("body") or "").strip()
+            match = _CAMERA_COUNT_MESSAGE_RE.search(body)
+            if match is None:
+                return
+            headers = payload.get("headers") if isinstance(payload.get("headers"), dict) else {}
+            station_id = _station_id_from_sip_value(_header_value(headers, "From"))
+            if not station_id:
+                station_id = _station_id_from_sip_value(str(payload.get("request_uri") or ""))
+            if not station_id:
+                _LOGGER.info(
+                    "[abb] sip_listener: camera count MESSAGE body=%r has no "
+                    "station id (from=%r request_uri=%r)",
+                    body[:200], _header_value(headers, "From"), payload.get("request_uri"),
+                )
+                return
+            handler = entry_data.get("camera_count_handler")
+            if not callable(handler):
+                _LOGGER.info(
+                    "[abb] sip_listener: camera count=%s for station=%s but "
+                    "camera handler is not ready",
+                    match.group(1), station_id,
+                )
+                return
+            _LOGGER.info(
+                "[abb] sip_listener: detected camera count=%s for station=%s "
+                "from MESSAGE body=%r",
+                match.group(1), station_id, body[:200],
+            )
+            handler(station_id, int(match.group(1)), body, "sip_listener")
 
         def _on_state_change(new_state: str) -> None:
             hass.bus.async_fire(

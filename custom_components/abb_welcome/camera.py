@@ -148,16 +148,22 @@ async def async_setup_entry(
         created_indexes.setdefault(key, set()).add(camera_index)
         return camera
 
-    def _on_camera_count_detected(door: Door, count: int, body: str) -> None:
+    def _on_camera_count_for_key(
+        key: str,
+        count: int,
+        body: str,
+        *,
+        source: str,
+        fallback_name: str = "unknown",
+    ) -> None:
         if count < 1:
             return
-        key = _door_key(door)
         meta = door_meta.get(key)
         if meta is None:
             _LOGGER.info(
                 "[abb] camera setup: detected camera count=%d for unknown "
-                "door=%s body=%r",
-                count, door.name, body[:200],
+                "door=%s source=%s body=%r",
+                count, fallback_name, source, body[:200],
             )
             return
 
@@ -193,10 +199,24 @@ async def async_setup_entry(
 
         _LOGGER.info(
             "[abb] camera setup: adding %d detected sub-camera entity(s) for "
-            "door=%s count=%d source_body=%r",
-            len(new_cameras), stored_door.name, count, body[:200],
+            "door=%s count=%d source=%s source_body=%r",
+            len(new_cameras), stored_door.name, count, source, body[:200],
         )
         async_add_entities(new_cameras)
+
+    def _on_camera_count_detected(door: Door, count: int, body: str) -> None:
+        _on_camera_count_for_key(
+            _door_key(door), count, body, source="intercom_dialer", fallback_name=door.name
+        )
+
+    def _on_listener_camera_count(
+        station_id: str, count: int, body: str, source: str = "sip_listener"
+    ) -> None:
+        _on_camera_count_for_key(
+            _safe_key(station_id), count, body, source=source, fallback_name=station_id
+        )
+
+    data["camera_count_handler"] = _on_listener_camera_count
 
     dialer = IntercomDialer(
         host=gw_ip,
