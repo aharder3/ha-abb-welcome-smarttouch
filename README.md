@@ -15,6 +15,15 @@ For Apple Home / HomeKit, use the companion
 ABB Welcome stations into Apple Home as full HomeKit doorbells with live video,
 doorbell notifications, and two-way audio.
 
+> [!IMPORTANT]
+> **Want ABB Welcome in Apple Home? Use Scrypted.**
+>
+> HA's native HomeKit bridge can expose a basic camera/ring sensor, but it does
+> not provide the full HomeKit doorbell experience. For Apple Home notifications,
+> live video, audio, talkback, and safer pickup handling, install this HA
+> integration first, then add the companion
+> [ABB HA Doorbell Scrypted plugin][scrypted-bridge].
+
 ## Features
 
 - One Home Assistant **button entity per unlock-capable outdoor station**.
@@ -98,10 +107,35 @@ A successful pairing typically completes in under 15 seconds.
 
 ## Apple Home / HomeKit
 
-Do **not** rely on HA's native HomeKit bridge if you want a full Apple Home
-doorbell. HA can expose a one-way camera and ring sensor, but the usable HomeKit
-microphone path is provided by the companion
-[ABB HA Doorbell Scrypted plugin][scrypted-bridge].
+> [!IMPORTANT]
+> **Full Apple Home doorbell = HA integration + Scrypted plugin.**
+>
+> Do **not** rely on HA's native HomeKit bridge if you want a real Apple Home
+> doorbell. HA can expose a one-way camera and ring sensor, but the usable
+> HomeKit microphone path, Apple Home doorbell accessory, and pickup-safety
+> controls are provided by the companion
+> [ABB HA Doorbell Scrypted plugin][scrypted-bridge].
+
+| Goal | Use |
+|---|---|
+| Door buttons, HA cameras, ring events, SIP/RTP media, talkback services | This Home Assistant integration |
+| Import ABB stations into Apple Home as full HomeKit doorbells | [ABB HA Doorbell Scrypted plugin][scrypted-bridge] |
+| HomeKit microphone / two-way audio | Scrypted plugin, backed by HA talkback services |
+| Apple TV/Home Hub preview blocking | Scrypted plugin **HomeKit Pickup Safety** |
+| Basic one-way HomeKit camera only | HA native HomeKit bridge, if you do not need talkback |
+
+```mermaid
+flowchart LR
+    Door[ABB Welcome door station] -->|SIP INVITE ring| HA[Home Assistant integration]
+    HA -->|ring event + camera entities + talkback services| Scrypted[Scrypted plugin]
+    Scrypted -->|Doorbell accessory| HomeKit[Apple Home]
+    HomeKit -->|live view + microphone| Scrypted
+    Scrypted -->|PCM talkback services| HA
+    HA -->|PCMA/G.711 RTP| Door
+
+    TV[Apple TV / Home Hub preview] -. optional local preview .-> Scrypted
+    Scrypted -. HomeKit Pickup Safety can block local preview .-> TV
+```
 
 Recommended setup:
 
