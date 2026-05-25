@@ -14,7 +14,7 @@ complete in well under 100 ms.
 
 - One Home Assistant **button entity per unlock-capable outdoor station** (Outdoor 1 / Inner / Parking, etc.).
 - **WebRTC camera entities** for discovered outdoor stations, backed by HA's bundled go2rtc.
-- **LAN H.264 video + PCMA/G.711 audio** for live intercom streams. The integration also exposes PCMA talkback services for the currently active call; HomeKit microphone support is provided through the included Scrypted bridge.
+- **LAN H.264 video + PCMA/G.711 audio** for live intercom streams. The integration also exposes PCMA talkback services for the currently active call; HomeKit microphone support is provided through the companion [Scrypted bridge][scrypted-bridge].
 - **Streaming enabled switch** to explicitly arm live streaming. Intercom video/audio is building-wide exclusive, so streams do not start accidentally from frontend prefetches or HomeKit probes.
 - **Allow pickup switch** — when enabled, an incoming SIP INVITE briefly arms streaming so opening the camera from the notification can pick up the ringing station. When disabled, rings force streaming off so phones and indoor stations can answer safely.
 - **Image entity** with the latest doorbell screenshot. The gateway only captures a frame when someone rings, so `image_last_updated` reflects the actual ring time, not a polling timestamp.
@@ -129,7 +129,8 @@ answer.
 
 Current HA media support is door station → Home Assistant/browser video and audio.
 Talkback is exposed as HA services for the active stream; HomeKit two-way audio is
-bridged through Scrypted, which feeds microphone PCM back into those services.
+bridged through the companion [Scrypted bridge][scrypted-bridge], which feeds
+microphone PCM back into those services.
 
 ### Talkback
 
@@ -151,8 +152,8 @@ audio.
 
 ### Apple Home through Scrypted
 
-For a full HomeKit doorbell, use the included Scrypted bridge instead of HA's
-native HomeKit camera export:
+For a full HomeKit doorbell, use the companion [Scrypted bridge][scrypted-bridge]
+instead of HA's native HomeKit camera export:
 
 1. Configure this HA integration first and confirm the HA camera streams work.
 2. Install [`abb-ha-doorbell`][scrypted-bridge] in Scrypted.
