@@ -44,9 +44,12 @@
     "step": {
       "init": {
         "title": "ABB Welcome options",
-        "description": "How should this integration unlock doors?",
+        "description": "Door unlock behavior and the LAN RTSP endpoint used by Scrypted/HomeKit.",
         "data": {
-          "unlock_strategy": "Unlock strategy"
+          "unlock_strategy": "Unlock strategy",
+          "lan_rtsp_host": "Advertised Home Assistant LAN host (blank = auto)",
+          "lan_rtsp_port": "Preferred LAN RTSP proxy port",
+          "allow_pickup": "Allow pickup from streams"
         }
       }
     }

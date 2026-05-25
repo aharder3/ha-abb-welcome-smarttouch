@@ -22,6 +22,20 @@ SIP_PORT_TLS = 5061
 
 DATA_PORTAL_STATE = "portal_state"
 
+EVENT_DISCOVERY_CHANGED = f"{DOMAIN}_discovery_changed"
+
+GO2RTC_RTSP_HOST = "127.0.0.1"
+GO2RTC_RTSP_PORT = 18554
+
+CONF_LAN_RTSP_HOST = "lan_rtsp_host"
+CONF_LAN_RTSP_PORT = "lan_rtsp_port"
+DEFAULT_LAN_RTSP_BIND_HOST = "0.0.0.0"
+DEFAULT_LAN_RTSP_PORT = 18556
+DEFAULT_LAN_RTSP_PORT_PICK_ATTEMPTS = 100
+
+CONF_ALLOW_PICKUP = "allow_pickup"
+DEFAULT_ALLOW_PICKUP = True
+
 # Per-integration option: which unlock strategy to use.
 #   hybrid   — fast plain MESSAGE for the first outdoor station, INVITE-then-MESSAGE for the rest.
 #              Tested working on the reference gateway; lowest latency on the main door.

@@ -1,25 +1,54 @@
 """ABB Welcome integration — LAN door unlock + cloud event history via SIP."""
 
+import base64
+import binascii
 import json
 import logging
 import re
+import socket
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from urllib.parse import unquote
+from urllib.parse import unquote, urlparse
 
 import requests
 import voluptuous as vol
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant, ServiceCall, callback
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.start import async_at_start
 
-from .const import CONF_UNLOCK_STRATEGY, DEFAULT_UNLOCK_STRATEGY, DOMAIN, SIP_PORT_TLS
+from .const import (
+    CONF_ALLOW_PICKUP,
+    CONF_LAN_RTSP_HOST,
+    CONF_LAN_RTSP_PORT,
+    CONF_UNLOCK_STRATEGY,
+    DEFAULT_ALLOW_PICKUP,
+    DEFAULT_LAN_RTSP_BIND_HOST,
+    DEFAULT_LAN_RTSP_PORT,
+    DEFAULT_LAN_RTSP_PORT_PICK_ATTEMPTS,
+    DEFAULT_UNLOCK_STRATEGY,
+    DOMAIN,
+    EVENT_DISCOVERY_CHANGED,
+    GO2RTC_RTSP_HOST,
+    GO2RTC_RTSP_PORT,
+    SIP_PORT_TLS,
+)
 from .coordinator import ABBWelcomeCoordinator
+from .rtsp_proxy import RtspTcpProxy
 from .sip_client import SIPClient
 from .sip_listener import IncomingCall, SipListener
-from .streaming_state import ARM_REASON_RING, RING_ARM_SECONDS, arm
+from .streaming_state import (
+    ARM_REASON_MANUAL,
+    ARM_REASON_RING,
+    MANUAL_ARM_SECONDS,
+    RING_ARM_SECONDS,
+    arm,
+    disarm,
+    is_pickup_allowed,
+    set_pickup_allowed,
+)
 from .text import decode_gateway_text, repair_utf8_mojibake
 
 _LOGGER = logging.getLogger(__name__)
@@ -47,6 +76,62 @@ def _station_id_from_sip_value(value: str) -> str:
     return match.group(1).strip() if match else ""
 
 
+def _configured_hass_lan_host(hass: HomeAssistant) -> str:
+    """Return an HA URL host that LAN clients can use, if one is configured."""
+    for attr in ("internal_url", "external_url"):
+        raw = getattr(hass.config, attr, None)
+        host = urlparse(raw).hostname if raw else ""
+        if host and host not in ("0.0.0.0", "::", "localhost", "127.0.0.1"):
+            return host
+    api = getattr(hass.config, "api", None)
+    host = getattr(api, "host", None)
+    if host and host not in ("0.0.0.0", "::", "localhost", "127.0.0.1"):
+        return str(host)
+    return ""
+
+
+def _local_ip_for_peer(peer_host: str) -> str:
+    """Infer the local source address HA uses to reach the ABB gateway."""
+    if not peer_host:
+        return ""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.connect((peer_host, 80))
+        host = str(sock.getsockname()[0])
+        if host and host not in ("0.0.0.0", "127.0.0.1"):
+            return host
+    except OSError:
+        return ""
+    finally:
+        sock.close()
+    return ""
+
+
+def _coerce_lan_rtsp_port(value: object) -> int | None:
+    try:
+        port = int(value)
+    except (TypeError, ValueError):
+        return None
+    return port if 1024 <= port <= 65535 else None
+
+
+def _candidate_lan_rtsp_ports(configured_port: int | None) -> list[int]:
+    ports: list[int] = []
+    if configured_port is not None:
+        ports.append(configured_port)
+    for port in range(
+        DEFAULT_LAN_RTSP_PORT,
+        min(
+            65535,
+            DEFAULT_LAN_RTSP_PORT + DEFAULT_LAN_RTSP_PORT_PICK_ATTEMPTS - 1,
+        )
+        + 1,
+    ):
+        if port not in ports:
+            ports.append(port)
+    return ports
+
+
 for _name in (
     "custom_components.abb_welcome",
     "custom_components.abb_welcome.portal",
@@ -59,6 +144,7 @@ for _name in (
     "custom_components.abb_welcome.camera",
     "custom_components.abb_welcome.intercom_dialer",
     "custom_components.abb_welcome.media_pipeline",
+    "custom_components.abb_welcome.rtsp_proxy",
     "custom_components.abb_welcome.rtsp_server",
     "custom_components.abb_welcome.streaming_state",
     "custom_components.abb_welcome.switch",
@@ -77,6 +163,12 @@ PLATFORMS = [
     Platform.SENSOR,
     Platform.SWITCH,
 ]
+
+_RELOAD_OPTION_KEYS = (
+    CONF_LAN_RTSP_HOST,
+    CONF_LAN_RTSP_PORT,
+    CONF_UNLOCK_STRATEGY,
+)
 
 POLL_INTERVAL = timedelta(seconds=30)
 PRESERVED_DOOR_METADATA_KEYS = ("type", "can_unlock")
@@ -97,6 +189,24 @@ EVENT_SIP_FRAME = f"{DOMAIN}_sip_frame"
 EVENT_LISTENER_STATE = f"{DOMAIN}_listener_state"
 
 
+def _fire_discovery_changed(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    *,
+    reason: str,
+    **extra: object,
+) -> None:
+    """Notify external bridges that ABB entity discovery should be refreshed."""
+    payload = {
+        "entry_id": entry.entry_id,
+        "reason": reason,
+        "gateway_ip": entry.data.get("gateway_ip", ""),
+        "door_count": len(entry.data.get("doors", []) or []),
+        **extra,
+    }
+    hass.bus.async_fire(EVENT_DISCOVERY_CHANGED, payload)
+
+
 def _build_client(entry: ConfigEntry) -> SIPClient:
     return SIPClient(
         host=entry.data["gateway_ip"],
@@ -108,6 +218,78 @@ def _build_client(entry: ConfigEntry) -> SIPClient:
             CONF_UNLOCK_STRATEGY, DEFAULT_UNLOCK_STRATEGY
         ),
     )
+
+
+def _reload_relevant_options(entry: ConfigEntry) -> dict[str, object]:
+    return {key: entry.options.get(key) for key in _RELOAD_OPTION_KEYS}
+
+
+async def _async_start_rtsp_proxy(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    entry_data: dict,
+) -> RtspTcpProxy:
+    """Start the LAN RTSP proxy, changing and persisting the port if needed."""
+    configured_port = _coerce_lan_rtsp_port(entry.options.get(CONF_LAN_RTSP_PORT))
+    candidate_ports = _candidate_lan_rtsp_ports(configured_port)
+
+    last_proxy: RtspTcpProxy | None = None
+    for port in candidate_ports:
+        proxy = RtspTcpProxy(
+            bind_host=DEFAULT_LAN_RTSP_BIND_HOST,
+            bind_port=port,
+            target_host=GO2RTC_RTSP_HOST,
+            target_port=GO2RTC_RTSP_PORT,
+        )
+        last_proxy = proxy
+        if not await proxy.start():
+            await proxy.stop()
+            continue
+
+        entry_data["rtsp_proxy"] = proxy
+        entry_data["lan_rtsp_port"] = port
+        entry_data["lan_rtsp_proxy_running"] = True
+        entry_data["lan_rtsp_port_changed"] = port != configured_port
+        if port != configured_port:
+            hass.config_entries.async_update_entry(
+                entry,
+                options={
+                    **dict(entry.options),
+                    CONF_LAN_RTSP_PORT: port,
+                },
+            )
+            _LOGGER.info(
+                "[abb] selected LAN RTSP proxy port %d and persisted it in "
+                "options (previous=%s)",
+                port,
+                configured_port if configured_port is not None else "unset",
+            )
+        return proxy
+
+    proxy = last_proxy or RtspTcpProxy(
+        bind_host=DEFAULT_LAN_RTSP_BIND_HOST,
+        bind_port=configured_port or DEFAULT_LAN_RTSP_PORT,
+        target_host=GO2RTC_RTSP_HOST,
+        target_port=GO2RTC_RTSP_PORT,
+    )
+    entry_data["rtsp_proxy"] = proxy
+    entry_data["lan_rtsp_port"] = proxy.bind_port
+    entry_data["lan_rtsp_proxy_running"] = False
+    entry_data["lan_rtsp_port_changed"] = False
+    port_detail = (
+        f"{configured_port}, " if configured_port is not None else ""
+    ) + (
+        f"{DEFAULT_LAN_RTSP_PORT}-"
+        f"{DEFAULT_LAN_RTSP_PORT + DEFAULT_LAN_RTSP_PORT_PICK_ATTEMPTS - 1}"
+    )
+    _LOGGER.error(
+        "[abb] LAN RTSP proxy could not bind any candidate port (%s); "
+        "Scrypted/HomeKit streaming will be unavailable until a free port is "
+        "configured in ABB Welcome options. Last error: %s",
+        port_detail,
+        proxy.last_error or "unknown",
+    )
+    return proxy
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -127,6 +309,30 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         "coordinator": coordinator,
     }
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = entry_data
+    set_pickup_allowed(
+        hass,
+        entry.entry_id,
+        entry.options.get(CONF_ALLOW_PICKUP, DEFAULT_ALLOW_PICKUP),
+    )
+
+    lan_rtsp_host = str(entry.options.get(CONF_LAN_RTSP_HOST, "") or "").strip()
+    if not lan_rtsp_host:
+        lan_rtsp_host = _configured_hass_lan_host(hass)
+    if not lan_rtsp_host:
+        lan_rtsp_host = await hass.async_add_executor_job(
+            _local_ip_for_peer, entry.data.get("gateway_ip", "")
+        )
+    if not lan_rtsp_host:
+        lan_rtsp_host = "<home-assistant-lan-ip>"
+
+    entry_data["lan_rtsp_host"] = lan_rtsp_host
+
+    rtsp_proxy = await _async_start_rtsp_proxy(hass, entry, entry_data)
+
+    async def _stop_rtsp_proxy(*_args) -> None:
+        await rtsp_proxy.stop()
+
+    entry.async_on_unload(_stop_rtsp_proxy)
 
     # Initial poll
     if coordinator.has_certs:
@@ -173,15 +379,25 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             sensor = entry_data.get("ringing_sensor")
             if sensor is not None:
                 sensor.trigger_ring(payload)
-            # Auto-arm streaming so the user can answer the ring within
-            # the next minute (clicking the camera or accepting a HomeKit
-            # doorbell notification triggers a stream straight away).
-            arm(
-                hass,
-                entry.entry_id,
-                reason=ARM_REASON_RING,
-                duration=RING_ARM_SECONDS,
-            )
+            if is_pickup_allowed(hass, entry.entry_id):
+                # Auto-arm streaming so the user can answer the ring within
+                # the next minute (clicking the camera or accepting a HomeKit
+                # doorbell notification triggers a stream straight away).
+                arm(
+                    hass,
+                    entry.entry_id,
+                    reason=ARM_REASON_RING,
+                    duration=RING_ARM_SECONDS,
+                    station_id=station_id,
+                )
+            else:
+                _LOGGER.info(
+                    "[abb] incoming ring from station=%s call_id=%s while "
+                    "pickup is disabled; disarming streaming",
+                    station_id,
+                    call.call_id,
+                )
+                disarm(hass, entry.entry_id)
 
         def _on_frame(payload: dict) -> None:
             hass.bus.async_fire(EVENT_SIP_FRAME, payload)
@@ -311,14 +527,33 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
         entry.async_on_unload(_stop_listener)
 
+    entry_data["reload_options"] = _reload_relevant_options(entry)
     entry.async_on_unload(entry.add_update_listener(_async_options_updated))
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    _fire_discovery_changed(
+        hass,
+        entry,
+        reason=(
+            "rtsp_proxy_started"
+            if entry_data.get("lan_rtsp_proxy_running")
+            else "rtsp_proxy_failed"
+        ),
+        lan_rtsp_host=entry_data.get("lan_rtsp_host", ""),
+        lan_rtsp_port=entry_data.get("lan_rtsp_port"),
+        lan_rtsp_proxy_running=bool(entry_data.get("lan_rtsp_proxy_running")),
+        port_changed=bool(entry_data.get("lan_rtsp_port_changed")),
+    )
     _async_register_services(hass)
     return True
 
 
 SERVICE_EXPORT_CREDENTIALS = "export_credentials"
 SERVICE_REFRESH_DOORS = "refresh_doors"
+SERVICE_ARM_STREAMING = "arm_streaming"
+SERVICE_TALK_START = "talk_start"
+SERVICE_TALK_STOP = "talk_stop"
+SERVICE_TALK_PCM16LE = "talk_pcm16le"
+SERVICE_TALK_TONE = "talk_tone"
 EXPORT_FIELDS = (
     "gateway_ip",
     "sip_username",
@@ -512,9 +747,101 @@ async def _async_refresh_doors_for_entry(
     hass.config_entries.async_update_entry(
         entry, data={**entry.data, "doors": new_doors}
     )
+    _fire_discovery_changed(
+        hass,
+        entry,
+        reason="doors_changed",
+        door_count=len(new_doors),
+    )
     if reload_on_change:
         await hass.config_entries.async_reload(entry.entry_id)
     return True
+
+
+def _normalise_entity_ids(raw: object) -> list[str]:
+    if raw is None or raw == "":
+        return []
+    if isinstance(raw, str):
+        return [raw]
+    if isinstance(raw, (list, tuple, set)):
+        return [str(item) for item in raw if item]
+    return [str(raw)]
+
+
+def _camera_sort_key(camera: object) -> tuple[int, int, int]:
+    scorer = getattr(camera, "talkback_target_score", None)
+    if callable(scorer):
+        return scorer()
+    ready = bool(getattr(camera, "talkback_ready", False))
+    session = getattr(camera, "_session", None)
+    active = bool(getattr(session, "active", False))
+    camera_index = getattr(camera, "_camera_index", None)
+    return (0 if ready else 1, 0 if active else 1, 0 if camera_index is None else 1)
+
+
+def _cameras_for_talk_service(hass: HomeAssistant, call: ServiceCall) -> list[object]:
+    entries = hass.data.get(DOMAIN, {})
+    if not entries:
+        raise HomeAssistantError("No ABB Welcome config entries are loaded")
+
+    target_entry_id = call.data.get("entry_id")
+    if target_entry_id:
+        if target_entry_id not in entries:
+            raise HomeAssistantError(f"No ABB Welcome config entry id={target_entry_id!r}")
+        entry_items = [(target_entry_id, entries[target_entry_id])]
+    else:
+        entry_items = list(entries.items())
+
+    requested_entity_ids = _normalise_entity_ids(call.data.get("entity_id"))
+    station_id = str(call.data.get("station_id") or "").strip()
+
+    cameras: list[object] = []
+    missing_entities: set[str] = set(requested_entity_ids)
+    for _entry_id, entry_data in entry_items:
+        by_entity = entry_data.get("camera_entities_by_entity_id", {})
+        if not isinstance(by_entity, dict):
+            by_entity = {}
+
+        if requested_entity_ids:
+            for entity_id in requested_entity_ids:
+                camera = by_entity.get(entity_id)
+                if camera is not None:
+                    cameras.append(camera)
+                    missing_entities.discard(entity_id)
+            continue
+
+        if station_id:
+            by_station = entry_data.get("camera_entities_by_station", {})
+            if isinstance(by_station, dict):
+                cameras.extend(by_station.get(station_id, []))
+            if not cameras:
+                for camera in by_entity.values():
+                    door = getattr(camera, "_door", None)
+                    if str(getattr(door, "station_id", "") or "").strip() == station_id:
+                        cameras.append(camera)
+            continue
+
+        cameras.extend(by_entity.values())
+
+    if missing_entities:
+        missing = ", ".join(sorted(missing_entities))
+        raise HomeAssistantError(f"No loaded ABB Welcome camera entity: {missing}")
+
+    deduped: list[object] = []
+    seen: set[int] = set()
+    for camera in cameras:
+        marker = id(camera)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        deduped.append(camera)
+    if not deduped:
+        raise HomeAssistantError("No ABB Welcome camera target is loaded")
+
+    deduped.sort(key=_camera_sort_key)
+    if requested_entity_ids:
+        return deduped
+    return [deduped[0]]
 
 
 @callback
@@ -604,10 +931,206 @@ def _async_register_services(hass: HomeAssistant) -> None:
             schema=vol.Schema({vol.Optional("entry_id"): str}),
         )
 
+    if not hass.services.has_service(DOMAIN, SERVICE_ARM_STREAMING):
+
+        async def _arm_streaming(call: ServiceCall) -> None:
+            target_entry_id = call.data.get("entry_id")
+            station_id = str(call.data.get("station_id") or "").strip()
+            duration = float(call.data.get("duration") or MANUAL_ARM_SECONDS)
+            entries = hass.data.get(DOMAIN, {})
+            if not entries:
+                raise ValueError("No ABB Welcome config entries are loaded")
+            if target_entry_id:
+                if target_entry_id not in entries:
+                    raise ValueError(f"No config entry with id={target_entry_id!r}")
+                entry_ids = [target_entry_id]
+            else:
+                entry_ids = list(entries.keys())
+            for eid in entry_ids:
+                arm(
+                    hass,
+                    eid,
+                    reason=ARM_REASON_MANUAL,
+                    duration=duration,
+                    station_id=station_id,
+                )
+
+        hass.services.async_register(
+            DOMAIN,
+            SERVICE_ARM_STREAMING,
+            _arm_streaming,
+            schema=vol.Schema(
+                {
+                    vol.Optional("entry_id"): str,
+                    vol.Optional("station_id"): str,
+                    vol.Optional("duration"): vol.All(
+                        vol.Coerce(float), vol.Range(min=5, max=600)
+                    ),
+                }
+            ),
+        )
+
+    talk_target_schema = {
+        vol.Optional("entry_id"): str,
+        vol.Optional("entity_id"): vol.Any(str, [str]),
+        vol.Optional("station_id"): str,
+        vol.Optional("talkback_session_id"): str,
+        vol.Optional("session_id"): str,
+    }
+
+    if not hass.services.has_service(DOMAIN, SERVICE_TALK_START):
+
+        async def _talk_start(call: ServiceCall) -> None:
+            talkback_session_id = str(
+                call.data.get("talkback_session_id")
+                or call.data.get("session_id")
+                or ""
+            ).strip()
+            for camera in _cameras_for_talk_service(hass, call):
+                start = getattr(camera, "async_talkback_start", None)
+                if not callable(start):
+                    raise HomeAssistantError("Selected camera does not support talkback")
+                stats = await start(talkback_session_id)
+                _LOGGER.info(
+                    "[abb] talk_start target=%s stats=%s",
+                    getattr(camera, "entity_id", "unknown"),
+                    stats,
+                )
+
+        hass.services.async_register(
+            DOMAIN,
+            SERVICE_TALK_START,
+            _talk_start,
+            schema=vol.Schema(talk_target_schema),
+        )
+
+    if not hass.services.has_service(DOMAIN, SERVICE_TALK_STOP):
+
+        async def _talk_stop(call: ServiceCall) -> None:
+            talkback_session_id = str(
+                call.data.get("talkback_session_id")
+                or call.data.get("session_id")
+                or ""
+            ).strip()
+            for camera in _cameras_for_talk_service(hass, call):
+                stop = getattr(camera, "async_talkback_stop", None)
+                if not callable(stop):
+                    raise HomeAssistantError("Selected camera does not support talkback")
+                stats = await stop(talkback_session_id)
+                _LOGGER.info(
+                    "[abb] talk_stop target=%s stats=%s",
+                    getattr(camera, "entity_id", "unknown"),
+                    stats,
+                )
+
+        hass.services.async_register(
+            DOMAIN,
+            SERVICE_TALK_STOP,
+            _talk_stop,
+            schema=vol.Schema(talk_target_schema),
+        )
+
+    if not hass.services.has_service(DOMAIN, SERVICE_TALK_PCM16LE):
+
+        async def _talk_pcm16le(call: ServiceCall) -> None:
+            talkback_session_id = str(
+                call.data.get("talkback_session_id")
+                or call.data.get("session_id")
+                or ""
+            ).strip()
+            encoded = str(call.data["pcm16le"])
+            try:
+                pcm = base64.b64decode(encoded, validate=True)
+            except (binascii.Error, ValueError) as err:
+                raise HomeAssistantError("pcm16le must be base64-encoded bytes") from err
+            if len(pcm) % 2:
+                raise HomeAssistantError("pcm16le must contain whole 16-bit samples")
+            if len(pcm) > 160000:
+                raise HomeAssistantError("pcm16le payload is too large")
+            for camera in _cameras_for_talk_service(hass, call):
+                feed = getattr(camera, "async_talkback_pcm16le", None)
+                if not callable(feed):
+                    raise HomeAssistantError("Selected camera does not support talkback")
+                stats = await feed(pcm, talkback_session_id)
+                _LOGGER.info(
+                    "[abb] talk_pcm16le target=%s bytes=%d stats=%s",
+                    getattr(camera, "entity_id", "unknown"),
+                    len(pcm),
+                    stats,
+                )
+
+        hass.services.async_register(
+            DOMAIN,
+            SERVICE_TALK_PCM16LE,
+            _talk_pcm16le,
+            schema=vol.Schema(
+                {
+                    **talk_target_schema,
+                    vol.Required("pcm16le"): str,
+                }
+            ),
+        )
+
+    if not hass.services.has_service(DOMAIN, SERVICE_TALK_TONE):
+
+        async def _talk_tone(call: ServiceCall) -> None:
+            talkback_session_id = str(
+                call.data.get("talkback_session_id")
+                or call.data.get("session_id")
+                or ""
+            ).strip()
+            for camera in _cameras_for_talk_service(hass, call):
+                tone = getattr(camera, "async_talkback_tone", None)
+                if not callable(tone):
+                    raise HomeAssistantError("Selected camera does not support talkback")
+                stats = await tone(
+                    duration_ms=call.data["duration_ms"],
+                    frequency_hz=call.data["frequency_hz"],
+                    amplitude=call.data["amplitude"],
+                    talkback_session_id=talkback_session_id,
+                )
+                _LOGGER.info(
+                    "[abb] talk_tone target=%s stats=%s",
+                    getattr(camera, "entity_id", "unknown"),
+                    stats,
+                )
+
+        hass.services.async_register(
+            DOMAIN,
+            SERVICE_TALK_TONE,
+            _talk_tone,
+            schema=vol.Schema(
+                {
+                    **talk_target_schema,
+                    vol.Optional("duration_ms", default=1200): vol.All(
+                        vol.Coerce(int), vol.Range(min=100, max=5000)
+                    ),
+                    vol.Optional("frequency_hz", default=880): vol.All(
+                        vol.Coerce(int), vol.Range(min=100, max=3000)
+                    ),
+                    vol.Optional("amplitude", default=0.35): vol.All(
+                        vol.Coerce(float), vol.Range(min=0.0, max=1.0)
+                    ),
+                }
+            ),
+        )
+
 
 async def _async_options_updated(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    """Rebuild the SIP client when the user changes options."""
-    hass.data[DOMAIN][entry.entry_id]["sip_client"] = _build_client(entry)
+    """Reload only for options that affect connection topology."""
+    entry_data = hass.data.get(DOMAIN, {}).get(entry.entry_id)
+    if entry_data is not None:
+        set_pickup_allowed(
+            hass,
+            entry.entry_id,
+            entry.options.get(CONF_ALLOW_PICKUP, DEFAULT_ALLOW_PICKUP),
+        )
+        current_reload_options = _reload_relevant_options(entry)
+        previous_reload_options = entry_data.get("reload_options")
+        entry_data["reload_options"] = current_reload_options
+        if previous_reload_options == current_reload_options:
+            return
+    await hass.config_entries.async_reload(entry.entry_id)
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:

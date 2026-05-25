@@ -323,6 +323,8 @@ class IntercomDialer:
         self._registered = False
         self._reader_task: asyncio.Task | None = None
         self._inbound_queue: asyncio.Queue[SipFrame] = asyncio.Queue()
+        self._call_end_waiters: dict[str, list[asyncio.Future[str]]] = {}
+        self._ended_call_reasons: dict[str, str] = {}
         self._lock = asyncio.Lock()
 
     @property
@@ -367,12 +369,16 @@ class IntercomDialer:
     async def _reset_connection_locked(self) -> None:
         writer = self._writer
         reader_task = self._reader_task
+        active_call_id = self._call.call_id if self._call is not None else ""
         self._reader = None
         self._writer = None
         self._reader_task = None
         self._registered = False
-        self._call = None
-        self._pending_camera_count_target = None
+        if active_call_id:
+            self._finish_call(active_call_id, "connection_reset")
+        else:
+            self._call = None
+            self._pending_camera_count_target = None
         while True:
             try:
                 self._inbound_queue.get_nowait()
@@ -442,6 +448,44 @@ class IntercomDialer:
                     pass
             await self._reset_connection_locked()
 
+    async def wait_call_end(self, call_id: str) -> str:
+        """Wait until the active outbound dialog with ``call_id`` ends."""
+        call_id = str(call_id or "").strip()
+        if not call_id:
+            return "unknown"
+        reason = self._ended_call_reasons.get(call_id)
+        if reason:
+            return reason
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future[str] = loop.create_future()
+        self._call_end_waiters.setdefault(call_id, []).append(fut)
+        try:
+            return await fut
+        finally:
+            waiters = self._call_end_waiters.get(call_id)
+            if waiters is not None and fut in waiters:
+                waiters.remove(fut)
+                if not waiters:
+                    self._call_end_waiters.pop(call_id, None)
+
+    def _finish_call(self, call_id: str, reason: str) -> None:
+        call_id = str(call_id or "").strip()
+        if not call_id:
+            return
+        if self._call is not None and self._call.call_id == call_id:
+            self._call = None
+        if (
+            self._pending_camera_count_target is not None
+            and self._pending_camera_count_target.call_id == call_id
+        ):
+            self._pending_camera_count_target = None
+        self._ended_call_reasons[call_id] = reason
+        while len(self._ended_call_reasons) > 32:
+            self._ended_call_reasons.pop(next(iter(self._ended_call_reasons)))
+        for fut in self._call_end_waiters.pop(call_id, []):
+            if not fut.done():
+                fut.set_result(reason)
+
     async def _reader_loop(self) -> None:
         assert self._reader is not None
         try:
@@ -465,21 +509,35 @@ class IntercomDialer:
                         continue
                     if frame.method == "BYE":
                         _LOGGER.info(
-                            "[abb] dialer: inbound BYE call_id=%s cseq=%s",
+                            "[abb] dialer: inbound BYE call_id=%s cseq=%s "
+                            "from=%s to=%s",
                             frame.header("Call-ID"),
                             frame.header("CSeq"),
+                            frame.header("From"),
+                            frame.header("To"),
                         )
                         await self._send_response(frame, 200, "OK")
-                        self._call = None
-                        self._pending_camera_count_target = None
+                        self._finish_call(frame.header("Call-ID"), "remote_bye")
                         continue
-                elif _LOGGER.isEnabledFor(logging.DEBUG):
-                    _LOGGER.debug(
-                        "[abb] dialer: inbound SIP response %s cseq=%s call_id=%s",
-                        frame.start_line,
-                        frame.header("CSeq"),
-                        frame.header("Call-ID"),
-                    )
+                elif frame.is_response:
+                    cseq = frame.header("CSeq")
+                    if cseq.upper().endswith((" INVITE", " BYE")):
+                        _LOGGER.info(
+                            "[abb] dialer: inbound SIP response %s cseq=%s "
+                            "call_id=%s contact=%s to=%s",
+                            frame.start_line,
+                            cseq,
+                            frame.header("Call-ID"),
+                            frame.header("Contact"),
+                            frame.header("To"),
+                        )
+                    elif _LOGGER.isEnabledFor(logging.DEBUG):
+                        _LOGGER.debug(
+                            "[abb] dialer: inbound SIP response %s cseq=%s call_id=%s",
+                            frame.start_line,
+                            cseq,
+                            frame.header("Call-ID"),
+                        )
                 await self._inbound_queue.put(frame)
         except (asyncio.IncompleteReadError, ConnectionError, asyncio.CancelledError):
             return
@@ -540,7 +598,7 @@ class IntercomDialer:
                 "cseq=%s body=%r",
                 uri, call_id, cseq, body,
             )
-        elif method in ("INVITE", "BYE"):
+        elif method in ("INVITE", "ACK", "BYE"):
             _LOGGER.info(
                 "[abb] dialer: outbound SIP %s target=%s call_id=%s cseq=%s "
                 "content_length=%d",
@@ -864,8 +922,7 @@ class IntercomDialer:
             )
         except asyncio.TimeoutError:
             pass
-        self._call = None
-        self._pending_camera_count_target = None
+        self._finish_call(call.call_id, "local_bye")
 
     async def send_active_message(
         self, body: str, *, timeout: float = 5.0

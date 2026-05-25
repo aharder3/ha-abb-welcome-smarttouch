@@ -8,6 +8,7 @@ import logging
 import tempfile
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -61,6 +62,9 @@ class ABBWelcomeData:
     events: list[IntercomEvent] = field(default_factory=list)
     latest_screenshot: bytes | None = None
     latest_screenshot_event_id: str = ""
+    latest_screenshots_by_station: dict[str, IntercomEvent] = field(
+        default_factory=dict
+    )
     last_event: IntercomEvent | None = None
     newest_event_id: str = ""
 
@@ -91,6 +95,64 @@ class ABBWelcomeCoordinator(DataUpdateCoordinator[ABBWelcomeData]):
             for door in entry.data.get("doors", []) or []
             if str(door.get("station_id", "")).strip()
         }
+
+    @staticmethod
+    def _timestamp_seconds(value: str | int | float | None) -> float | None:
+        if value in (None, ""):
+            return None
+        if isinstance(value, (int, float)):
+            return float(value)
+        text = str(value).strip()
+        if not text:
+            return None
+        if text.isdigit():
+            return float(text)
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.timestamp()
+
+    def _station_event_for_screenshot(
+        self,
+        screenshot: IntercomEvent,
+        events: list[IntercomEvent],
+    ) -> IntercomEvent | None:
+        """Find the station event that most likely produced a screenshot."""
+        candidates = [
+            evt for evt in events
+            if evt.event_id != screenshot.event_id and evt.station_id
+        ]
+        if not candidates:
+            return None
+
+        if screenshot.belongs_to:
+            for evt in candidates:
+                if (
+                    evt.event_id == screenshot.belongs_to
+                    or evt.belongs_to == screenshot.belongs_to
+                ):
+                    return evt
+
+        screenshot_ts = self._timestamp_seconds(screenshot.timestamp)
+        if screenshot_ts is None:
+            return candidates[0]
+
+        def score(evt: IntercomEvent) -> tuple[float, int]:
+            evt_ts = self._timestamp_seconds(evt.timestamp)
+            delta = abs((evt_ts or screenshot_ts) - screenshot_ts)
+            event_priority = 0 if evt.event_type == "ring" else 1
+            return (delta, event_priority)
+
+        best = min(candidates, key=score)
+        best_ts = self._timestamp_seconds(best.timestamp)
+        if best_ts is not None and abs(best_ts - screenshot_ts) > 120:
+            return None
+        return best
 
     @property
     def has_certs(self) -> bool:
@@ -176,7 +238,9 @@ class ABBWelcomeCoordinator(DataUpdateCoordinator[ABBWelcomeData]):
                                     str(payload.get("local_name", "")).strip()
                                 )
                                 if ie.local_id:
-                                    ie.station_id = ie.local_id.split("@", 1)[0].removeprefix("sip:")
+                                    ie.station_id = ie.local_id.split(
+                                        "@", 1
+                                    )[0].removeprefix("sip:")
                     except Exception:
                         pass
 
@@ -184,6 +248,21 @@ class ABBWelcomeCoordinator(DataUpdateCoordinator[ABBWelcomeData]):
                     ie.local_name = self._station_names.get(ie.station_id, "")
 
                 new_events.append(ie)
+
+            station_match_events = new_events + self._data.events
+            for ie in new_events:
+                if not ie.image_data:
+                    continue
+                station_event = self._station_event_for_screenshot(
+                    ie, station_match_events
+                )
+                if station_event is None:
+                    continue
+                ie.station_id = station_event.station_id
+                ie.local_id = station_event.local_id
+                ie.local_name = station_event.local_name or self._station_names.get(
+                    ie.station_id, ""
+                )
 
             if raw_events:
                 first_id = raw_events[0].get("id", "")
@@ -197,6 +276,10 @@ class ABBWelcomeCoordinator(DataUpdateCoordinator[ABBWelcomeData]):
             if newest_screenshot:
                 self._data.latest_screenshot = newest_screenshot
                 self._data.latest_screenshot_event_id = newest_screenshot_id
+
+            for ie in new_events:
+                if ie.image_data and ie.station_id:
+                    self._data.latest_screenshots_by_station[ie.station_id] = ie
 
             # Latest non-screenshot event for the sensor
             for ie in new_events:

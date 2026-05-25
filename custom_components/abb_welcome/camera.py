@@ -13,9 +13,7 @@ Streaming is gated and lazy:
 * the per-gateway *armed* flag (see :mod:`streaming_state`) decides
   whether streaming is permitted right now — accidentally opening the
   intercom locks out the whole building, so it stays off by default
-* on the first RTSP DESCRIBE from go2rtc (which fires when a browser/
-  HomeKit consumer asks for the stream) we dial the gateway and
-  return the gateway's SDP
+* DESCRIBE only returns the advertised SDP; it never dials the gateway
 * on PLAY we start forwarding RTP through the same TCP socket
 * on the *last* TEARDOWN (or connection close) we BYE the gateway
   after a brief grace period so the building's intercom is freed
@@ -26,8 +24,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+from collections.abc import Callable
 from http import HTTPStatus
-from urllib.parse import urljoin
+from typing import Any
+from urllib.parse import urljoin, urlparse
 
 from aiohttp import ClientError, ClientSession, ClientTimeout
 from go2rtc_client.ws import (
@@ -56,7 +56,7 @@ from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import DOMAIN
+from .const import DOMAIN, GO2RTC_RTSP_HOST, GO2RTC_RTSP_PORT
 from .intercom_dialer import Door, IntercomDialer
 from .media_pipeline import StreamSession
 from .rtsp_server import (
@@ -65,7 +65,13 @@ from .rtsp_server import (
     RtspServer,
     RtspSession,
 )
-from .streaming_state import is_armed, signal_armed_changed
+from .streaming_state import (
+    get_state,
+    is_armed,
+    is_pickup_allowed,
+    is_stream_allowed,
+    signal_armed_changed,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -109,6 +115,8 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     data = hass.data[DOMAIN][entry.entry_id]
+    data.setdefault("camera_entities_by_entity_id", {})
+    data.setdefault("camera_entities_by_station", {})
     sip_user = entry.data.get("sip_username")
     sip_pass = entry.data.get("sip_password")
     sip_domain = entry.data.get("sip_domain")
@@ -122,6 +130,9 @@ async def async_setup_entry(
     camera_entities: dict[tuple[str, int], ABBWelcomeCamera] = {}
     created_indexes: dict[str, set[int]] = {}
     detected_counts: dict[str, int] = {}
+    stream_coordinators: dict[tuple[str, int], StationStreamCoordinator] = (
+        data.setdefault("stream_coordinators", {})
+    )
 
     def _build_camera(
         door: Door,
@@ -132,10 +143,23 @@ async def async_setup_entry(
         can_unlock: bool | str | int | None,
     ) -> ABBWelcomeCamera:
         exposed_index = camera_index if camera_index > 1 else None
+        key = _door_key(door)
+        coordinator_key = (key, exposed_index or 0)
+        coordinator = stream_coordinators.get(coordinator_key)
+        if coordinator is None:
+            coordinator = StationStreamCoordinator(
+                hass=hass,
+                entry_id=entry.entry_id,
+                dialer=dialer,
+                incoming_listener=data.get("sip_listener"),
+                door=door,
+                camera_index=exposed_index,
+            )
+            stream_coordinators[coordinator_key] = coordinator
         camera = ABBWelcomeCamera(
             hass=hass,
             entry_id=entry.entry_id,
-            dialer=dialer,
+            coordinator=coordinator,
             door=door,
             gateway_uuid=gateway_uuid,
             camera_index=exposed_index,
@@ -143,7 +167,6 @@ async def async_setup_entry(
             station_type=station_type,
             can_unlock=can_unlock,
         )
-        key = _door_key(door)
         camera_entities[(key, camera_index)] = camera
         created_indexes.setdefault(key, set()).add(camera_index)
         return camera
@@ -242,6 +265,11 @@ async def async_setup_entry(
     async def _close_dialer(*_args) -> None:
         await dialer.close()
 
+    async def _close_stream_coordinators(*_args) -> None:
+        for coordinator in list(stream_coordinators.values()):
+            await coordinator.force_close()
+
+    entry.async_on_unload(_close_stream_coordinators)
     entry.async_on_unload(_close_dialer)
 
     cameras: list[Camera] = []
@@ -305,6 +333,293 @@ def _go2rtc_session(hass: HomeAssistant) -> ClientSession:
     return async_get_clientsession(hass)
 
 
+class StationStreamCoordinator:
+    """Own one gateway media session and fan it out to RTSP consumers."""
+
+    def __init__(
+        self,
+        *,
+        hass: HomeAssistant,
+        entry_id: str,
+        dialer: IntercomDialer,
+        incoming_listener: object | None,
+        door: Door,
+        camera_index: int | None,
+    ) -> None:
+        self.hass = hass
+        self.entry_id = entry_id
+        self.door = door
+        self.camera_index = camera_index
+        self._stream_lock = asyncio.Lock()
+        self._rtsp_play_sessions: list[RtspSession] = []
+        self._close_task: asyncio.Task | None = None
+        self._talkback_owner = ""
+        self._state_callbacks: list[Callable[[], None]] = []
+        self.session = StreamSession(
+            dialer=dialer,
+            door=door,
+            gateway_host=dialer.host,
+            camera_index=camera_index,
+            incoming_listener=incoming_listener,
+            pickup_allowed=lambda: is_pickup_allowed(self.hass, self.entry_id),
+            on_call_ended=self._on_gateway_call_ended,
+        )
+
+    @property
+    def active(self) -> bool:
+        return self.session.active
+
+    @property
+    def client_count(self) -> int:
+        return len(self._rtsp_play_sessions)
+
+    @property
+    def video_codec(self) -> str:
+        return self.session.video_codec
+
+    @property
+    def video_fmtp(self) -> str | None:
+        return self.session.video_fmtp
+
+    @property
+    def talkback_ready(self) -> bool:
+        return self.session.talkback_ready
+
+    @property
+    def talkback_owner(self) -> str:
+        return self._talkback_owner
+
+    def talkback_stats(self) -> dict[str, Any]:
+        stats = self.session.talkback_stats()
+        stats["owner"] = self._talkback_owner
+        return stats
+
+    def add_state_callback(self, callback: Callable[[], None]) -> None:
+        if callback not in self._state_callbacks:
+            self._state_callbacks.append(callback)
+
+    def remove_state_callback(self, callback: Callable[[], None]) -> None:
+        self._state_callbacks = [
+            existing for existing in self._state_callbacks if existing is not callback
+        ]
+
+    def _notify_state(self) -> None:
+        for callback in list(self._state_callbacks):
+            try:
+                callback()
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.debug("[abb] stream coordinator callback failed: %s", err)
+
+    def _cancel_close_task(self) -> None:
+        if self._close_task is not None and not self._close_task.done():
+            self._close_task.cancel()
+        self._close_task = None
+
+    async def attach_rtsp_session(self, sess: RtspSession) -> bool:
+        self._cancel_close_task()
+        _LOGGER.info(
+            "[abb] stream coordinator: attach RTSP session station=%s "
+            "session=%s active_before=%s clients_before=%d",
+            self.door.station_id or self.door.address,
+            sess.session_id,
+            self.session.active,
+            len(self._rtsp_play_sessions),
+        )
+        self._add_rtsp_play_session(sess)
+        self.session.set_packet_handlers(
+            on_video=self._forward_video,
+            on_audio=self._forward_audio,
+        )
+        self._notify_state()
+        try:
+            async with self._stream_lock:
+                if not self.session.active:
+                    await self.session.open()
+        except Exception:
+            self._discard_rtsp_play_session(sess)
+            if not self._rtsp_play_sessions:
+                self.session.set_packet_handlers(on_video=None, on_audio=None)
+            sess.close()
+            self._notify_state()
+            raise
+
+        self._notify_state()
+        _LOGGER.info(
+            "[abb] stream coordinator: attached RTSP session station=%s "
+            "session=%s active=%s clients=%d",
+            self.door.station_id or self.door.address,
+            sess.session_id,
+            self.session.active,
+            len(self._rtsp_play_sessions),
+        )
+        return True
+
+    def detach_rtsp_session(self, sess: RtspSession) -> None:
+        self._discard_rtsp_play_session(sess)
+        _LOGGER.info(
+            "[abb] stream coordinator: detached RTSP session station=%s "
+            "session=%s active=%s clients=%d",
+            self.door.station_id or self.door.address,
+            sess.session_id,
+            self.session.active,
+            len(self._rtsp_play_sessions),
+        )
+        if not self._rtsp_play_sessions:
+            self.session.set_packet_handlers(on_video=None, on_audio=None)
+            self._schedule_close()
+        self._notify_state()
+
+    def _on_gateway_call_ended(self, call_id: str, reason: str) -> None:
+        if not self._rtsp_play_sessions:
+            return
+        sessions = list(self._rtsp_play_sessions)
+        self._rtsp_play_sessions = []
+        self.session.set_packet_handlers(on_video=None, on_audio=None)
+        _LOGGER.info(
+            "[abb] stream coordinator: closing %d RTSP client(s) after "
+            "gateway call ended station=%s call_id=%s reason=%s",
+            len(sessions),
+            self.door.station_id or self.door.address,
+            call_id,
+            reason,
+        )
+        for sess in sessions:
+            sess.close()
+        self._notify_state()
+
+    async def force_close(self) -> None:
+        self._cancel_close_task()
+        self._rtsp_play_sessions = []
+        self.session.set_packet_handlers(on_video=None, on_audio=None)
+        async with self._stream_lock:
+            if self.session.active:
+                await self.session.close()
+        self._talkback_owner = ""
+        self._notify_state()
+
+    def _schedule_close(self) -> None:
+        self._cancel_close_task()
+        self._close_task = self.hass.async_create_background_task(
+            self._delayed_close(),
+            name=f"abb_stream_close_{self.door.station_id or self.door.address}",
+        )
+
+    async def _delayed_close(self) -> None:
+        try:
+            await asyncio.sleep(_TEARDOWN_GRACE_SECONDS)
+        except asyncio.CancelledError:
+            return
+        if self._rtsp_play_sessions:
+            return
+        async with self._stream_lock:
+            if self._rtsp_play_sessions:
+                return
+            if self.session.active:
+                await self.session.close()
+        self._talkback_owner = ""
+        self._notify_state()
+
+    def _add_rtsp_play_session(self, sess: RtspSession) -> None:
+        if any(client is sess for client in self._rtsp_play_sessions):
+            return
+        self._rtsp_play_sessions.append(sess)
+
+    def _discard_rtsp_play_session(self, sess: RtspSession) -> None:
+        self._rtsp_play_sessions = [
+            client for client in self._rtsp_play_sessions if client is not sess
+        ]
+
+    def _forward_video(self, packet: bytes) -> None:
+        for client in list(self._rtsp_play_sessions):
+            if not client.push_rtp(VIDEO_RTP_CHANNEL, packet):
+                self._discard_rtsp_play_session(client)
+        if not self._rtsp_play_sessions:
+            self.session.set_packet_handlers(on_video=None, on_audio=None)
+            self._schedule_close()
+            self._notify_state()
+
+    def _forward_audio(self, packet: bytes) -> None:
+        for client in list(self._rtsp_play_sessions):
+            if not client.push_rtp(AUDIO_RTP_CHANNEL, packet):
+                self._discard_rtsp_play_session(client)
+        if not self._rtsp_play_sessions:
+            self.session.set_packet_handlers(on_video=None, on_audio=None)
+            self._schedule_close()
+            self._notify_state()
+
+    def start_talkback(self, session_id: str = "") -> dict[str, Any]:
+        session_id = str(session_id or "").strip()
+        if self._talkback_owner and session_id and self._talkback_owner != session_id:
+            _LOGGER.info(
+                "[abb] talkback owner changing for station=%s old=%s new=%s",
+                self.door.station_id or self.door.address,
+                self._talkback_owner,
+                session_id,
+            )
+        self._talkback_owner = session_id
+        stats = self.session.start_talkback()
+        stats["owner"] = self._talkback_owner
+        self._notify_state()
+        return stats
+
+    def stop_talkback(self, session_id: str = "") -> dict[str, Any]:
+        session_id = str(session_id or "").strip()
+        if session_id and self._talkback_owner and session_id != self._talkback_owner:
+            stats = self.talkback_stats()
+            stats["ignored"] = True
+            stats["ignore_reason"] = "talkback_session_owner_mismatch"
+            return stats
+        stats = self.session.stop_talkback()
+        self._talkback_owner = ""
+        stats["owner"] = self._talkback_owner
+        self._notify_state()
+        return stats
+
+    def feed_talkback_pcm16le(
+        self,
+        pcm: bytes,
+        session_id: str = "",
+    ) -> dict[str, Any]:
+        session_id = str(session_id or "").strip()
+        if session_id and self._talkback_owner and session_id != self._talkback_owner:
+            stats = self.talkback_stats()
+            stats["queued_frames_now"] = 0
+            stats["ignored"] = True
+            stats["ignore_reason"] = "talkback_session_owner_mismatch"
+            return stats
+        if session_id and not self._talkback_owner:
+            self._talkback_owner = session_id
+        stats = self.session.feed_talkback_pcm16le(pcm)
+        stats["owner"] = self._talkback_owner
+        self._notify_state()
+        return stats
+
+    async def send_talkback_tone(
+        self,
+        *,
+        duration_ms: int = 1200,
+        frequency_hz: int = 880,
+        amplitude: float = 0.35,
+        session_id: str = "",
+    ) -> dict[str, Any]:
+        session_id = str(session_id or "").strip()
+        if session_id and self._talkback_owner and session_id != self._talkback_owner:
+            stats = self.talkback_stats()
+            stats["ignored"] = True
+            stats["ignore_reason"] = "talkback_session_owner_mismatch"
+            return stats
+        if session_id and not self._talkback_owner:
+            self._talkback_owner = session_id
+        stats = await self.session.send_talkback_tone(
+            duration_ms=duration_ms,
+            frequency_hz=frequency_hz,
+            amplitude=amplitude,
+        )
+        stats["owner"] = self._talkback_owner
+        self._notify_state()
+        return stats
+
+
 class ABBWelcomeCamera(Camera):
     """Camera entity backed by per-entity RTSP server + lazy SIP dial."""
 
@@ -317,7 +632,7 @@ class ABBWelcomeCamera(Camera):
         *,
         hass: HomeAssistant,
         entry_id: str,
-        dialer: IntercomDialer,
+        coordinator: StationStreamCoordinator,
         door: Door,
         gateway_uuid: str,
         camera_index: int | None,
@@ -328,7 +643,7 @@ class ABBWelcomeCamera(Camera):
         super().__init__()
         self.hass = hass
         self._entry_id = entry_id
-        self._dialer = dialer
+        self._coordinator = coordinator
         self._door = door
         self._gateway_uuid = gateway_uuid
         self._camera_index = camera_index
@@ -355,12 +670,6 @@ class ABBWelcomeCamera(Camera):
         )
         self._stream_name = f"abb_{station_key}{camera_suffix}"
 
-        self._session = StreamSession(
-            dialer=dialer,
-            door=door,
-            gateway_host=dialer.host,
-            camera_index=camera_index,
-        )
         self._rtsp = RtspServer(
             host="127.0.0.1",
             on_describe=self._on_rtsp_describe,
@@ -373,7 +682,7 @@ class ABBWelcomeCamera(Camera):
         self._ws_clients: dict[str, Go2RtcWsClient] = {}
         self._ws_pending_candidates: dict[str, list[str]] = {}
 
-        self._stream_lock = asyncio.Lock()
+        self._state_callback = self.async_write_ha_state
         self._unsub_armed: callable | None = None
 
     def set_camera_count(self, count: int) -> None:
@@ -391,14 +700,33 @@ class ABBWelcomeCamera(Camera):
         return CameraCapabilities(frontend_stream_types={StreamType.WEB_RTC})
 
     @property
-    def extra_state_attributes(self) -> dict[str, str | int | bool]:
-        attrs: dict[str, str | int | bool] = {
+    def extra_state_attributes(self) -> dict[str, Any]:
+        talkback_stats = self._coordinator.talkback_stats()
+        snapshot = self._station_screenshot()
+        armed_state = get_state(self.hass, self._entry_id)
+        attrs: dict[str, Any] = {
             "go2rtc_stream": self._stream_name,
             "rtsp_url": self._rtsp.url if self._rtsp.port else "",
+            "lan_rtsp_url": self._lan_rtsp_url(),
+            "lan_rtsp_proxy_running": self._lan_rtsp_proxy_running(),
+            "lan_rtsp_proxy_port": self._lan_rtsp_proxy_port(),
             "armed": is_armed(self.hass, self._entry_id),
+            "stream_target_station_id": armed_state.target_station_id,
+            "stream_allowed": self._stream_allowed(),
+            "pickup_allowed": is_pickup_allowed(self.hass, self._entry_id),
             "ws_sessions": len(self._ws_clients),
             "rtsp_sessions": self._rtsp.session_count,
-            "stream_active": self._session.active,
+            "stream_clients": self._coordinator.client_count,
+            "stream_active": self._coordinator.active,
+            "snapshot_event_id": snapshot.event_id if snapshot else "",
+            "snapshot_station_id": snapshot.station_id if snapshot else "",
+            "talkback_ready": self._coordinator.talkback_ready,
+            "talkback_talking": bool(talkback_stats.get("talking")),
+            "talkback_packets": int(talkback_stats.get("packets", 0) or 0),
+            "talkback_voice_packets": int(
+                talkback_stats.get("voice_packets", 0) or 0
+            ),
+            "talkback_owner": talkback_stats.get("owner") or "",
             "camera_count": self._camera_count,
             "camera_interface": self._camera_count > 1,
         }
@@ -411,12 +739,50 @@ class ABBWelcomeCamera(Camera):
             attrs["can_unlock"] = self._can_unlock
         return attrs
 
+    def _lan_rtsp_url(self) -> str:
+        entry_data = self.hass.data.get(DOMAIN, {}).get(self._entry_id)
+        proxy = entry_data.get("rtsp_proxy") if isinstance(entry_data, dict) else None
+        if proxy is None or not getattr(proxy, "running", False):
+            return ""
+        port = getattr(proxy, "bind_port", None)
+        if not port:
+            return ""
+        host = str(entry_data.get("lan_rtsp_host") or "").strip()
+        if not host:
+            host = self._ha_lan_host()
+        return f"rtsp://{host}:{port}/{self._stream_name}"
+
+    def _lan_rtsp_proxy_running(self) -> bool:
+        entry_data = self.hass.data.get(DOMAIN, {}).get(self._entry_id)
+        proxy = entry_data.get("rtsp_proxy") if isinstance(entry_data, dict) else None
+        return bool(proxy is not None and getattr(proxy, "running", False))
+
+    def _lan_rtsp_proxy_port(self) -> int | None:
+        entry_data = self.hass.data.get(DOMAIN, {}).get(self._entry_id)
+        proxy = entry_data.get("rtsp_proxy") if isinstance(entry_data, dict) else None
+        port = getattr(proxy, "bind_port", None)
+        return int(port) if port else None
+
+    def _ha_lan_host(self) -> str:
+        for attr in ("internal_url", "external_url"):
+            raw = getattr(self.hass.config, attr, None)
+            host = urlparse(raw).hostname if raw else ""
+            if host and host not in ("0.0.0.0", "::", "localhost", "127.0.0.1"):
+                return host
+        api = getattr(self.hass.config, "api", None)
+        host = getattr(api, "host", None)
+        if host and host not in ("0.0.0.0", "::", "localhost", "127.0.0.1"):
+            return str(host)
+        return "<home-assistant-lan-ip>"
+
     # ------------------------------------------------------------------ #
     # entity lifecycle                                                   #
     # ------------------------------------------------------------------ #
 
     async def async_added_to_hass(self) -> None:
         await super().async_added_to_hass()
+        self._register_camera_service_target()
+        self._coordinator.add_state_callback(self._state_callback)
         self._unsub_armed = async_dispatcher_connect(
             self.hass,
             signal_armed_changed(self._entry_id),
@@ -433,6 +799,8 @@ class ABBWelcomeCamera(Camera):
         await self._register_with_go2rtc()
 
     async def async_will_remove_from_hass(self) -> None:
+        self._unregister_camera_service_target()
+        self._coordinator.remove_state_callback(self._state_callback)
         if self._unsub_armed is not None:
             self._unsub_armed()
             self._unsub_armed = None
@@ -446,36 +814,63 @@ class ABBWelcomeCamera(Camera):
         self._ws_pending_candidates.clear()
 
         await self._rtsp.stop()
-        if self._session.active:
-            await self._session.close()
+        await self._coordinator.force_close()
         await self._unregister_from_go2rtc()
         await super().async_will_remove_from_hass()
 
+    def _register_camera_service_target(self) -> None:
+        entry_data = self.hass.data.get(DOMAIN, {}).get(self._entry_id)
+        if entry_data is None:
+            return
+        by_entity = entry_data.setdefault("camera_entities_by_entity_id", {})
+        by_entity[self.entity_id] = self
+        station_id = str(self._door.station_id or "").strip()
+        if station_id:
+            by_station = entry_data.setdefault("camera_entities_by_station", {})
+            cameras = by_station.setdefault(station_id, [])
+            if self not in cameras:
+                cameras.append(self)
+
+    def _unregister_camera_service_target(self) -> None:
+        entry_data = self.hass.data.get(DOMAIN, {}).get(self._entry_id)
+        if entry_data is None:
+            return
+        by_entity = entry_data.get("camera_entities_by_entity_id")
+        if isinstance(by_entity, dict):
+            by_entity.pop(self.entity_id, None)
+        station_id = str(self._door.station_id or "").strip()
+        by_station = entry_data.get("camera_entities_by_station")
+        if station_id and isinstance(by_station, dict):
+            cameras = by_station.get(station_id)
+            if isinstance(cameras, list) and self in cameras:
+                cameras.remove(self)
+                if not cameras:
+                    by_station.pop(station_id, None)
+
     @callback
     def _on_armed_changed(self) -> None:
-        if not is_armed(self.hass, self._entry_id):
-            if self._rtsp.session_count or self._session.active:
+        if not self._stream_allowed():
+            if self._rtsp.session_count or self._coordinator.active:
                 _LOGGER.info(
-                    "[abb] camera %s: armed flipped off, force-closing "
+                    "[abb] camera %s: stream no longer permitted, force-closing "
                     "camera_index=%s rtsp_sessions=%d active=%s",
                     self._attr_name,
                     self._camera_index
                     if self._camera_index is not None
                     else "default",
                     self._rtsp.session_count,
-                    self._session.active,
+                    self._coordinator.active,
                 )
                 self.hass.async_create_task(self._force_teardown())
         self.async_write_ha_state()
 
     async def _force_teardown(self) -> None:
         await self._rtsp.stop()
-        async with self._stream_lock:
-            if self._session.active:
-                await self._session.close()
+        await self._coordinator.force_close()
         # Restart server so future connections still work.
         await self._rtsp.start()
         await self._register_with_go2rtc()
+        self.async_write_ha_state()
 
     # ------------------------------------------------------------------ #
     # go2rtc registration                                                #
@@ -556,46 +951,41 @@ class ABBWelcomeCamera(Camera):
     # ------------------------------------------------------------------ #
 
     async def _on_rtsp_describe(self) -> str | None:
+        armed_state = get_state(self.hass, self._entry_id)
         _LOGGER.info(
-            "[abb] camera %s: DESCRIBE armed=%s active=%s rtsp_sessions=%d "
-            "camera_index=%s camera_count=%d switch_body=%s",
+            "[abb] camera %s: DESCRIBE armed=%s target_station=%s "
+            "allowed=%s active=%s rtsp_sessions=%d camera_index=%s "
+            "camera_count=%d switch_body=%s",
             self._attr_name,
-            is_armed(self.hass, self._entry_id),
-            self._session.active,
+            armed_state.armed,
+            armed_state.target_station_id or "any",
+            self._stream_allowed(),
+            self._coordinator.active,
             self._rtsp.session_count,
             self._camera_index if self._camera_index is not None else "default",
             self._camera_count,
             f"d:{self._camera_index}" if self._camera_index is not None else "none",
         )
-        if not is_armed(self.hass, self._entry_id):
+        if not self._stream_allowed():
             _LOGGER.info(
-                "[abb] camera %s: refusing DESCRIBE (not armed) camera_index=%s",
+                "[abb] camera %s: refusing DESCRIBE (not armed for station) "
+                "camera_index=%s station=%s target=%s",
                 self._attr_name,
                 self._camera_index if self._camera_index is not None else "default",
+                self._station_id() or "unknown",
+                armed_state.target_station_id or "any",
             )
             return None
-        async with self._stream_lock:
-            if not self._session.active:
-                try:
-                    await self._session.open()
-                except Exception as err:  # noqa: BLE001
-                    _LOGGER.exception(
-                        "[abb] camera %s: failed to open stream session "
-                        "camera_index=%s: %s",
-                        self._attr_name,
-                        self._camera_index
-                        if self._camera_index is not None
-                        else "default",
-                        err,
-                    )
-                    return None
-        codec = self._session.video_codec or "H264/90000"
+        codec = self._coordinator.video_codec or "H264/90000"
         # WebRTC matcher needs a profile-level-id; ABB doesn't include
         # one in its SDP answer (we'd just have packetization-mode), and
         # without it go2rtc 1.9.9 logs "codecs not matched".  42e01f =
         # Constrained Baseline @ Level 3.1 — a safe lowest-common-
         # denominator that essentially all WebRTC clients accept.
-        fmtp = self._session.video_fmtp or "packetization-mode=1;profile-level-id=42e01f"
+        fmtp = (
+            self._coordinator.video_fmtp
+            or "packetization-mode=1;profile-level-id=42e01f"
+        )
         # PCMA is one of the codecs WebRTC keeps in its standard menu
         # (RFC 7874) so browsers offer it alongside Opus — verified
         # locally with go2rtc 1.9.9: it passthroughs PCMA in the
@@ -626,21 +1016,36 @@ class ABBWelcomeCamera(Camera):
         return "\r\n".join(sdp_lines) + "\r\n"
 
     async def _on_rtsp_play(self, sess: RtspSession) -> None:
-        # Wire StreamSession's RTP packets to the RTSP TCP-interleaved push.
-        def _on_video(packet: bytes) -> None:
-            sess.push_rtp(VIDEO_RTP_CHANNEL, packet)
+        if not self._stream_allowed():
+            _LOGGER.info(
+                "[abb] camera %s: refusing PLAY (not armed for station) "
+                "camera_index=%s station=%s",
+                self._attr_name,
+                self._camera_index if self._camera_index is not None else "default",
+                self._station_id() or "unknown",
+            )
+            return
 
-        def _on_audio(packet: bytes) -> None:
-            sess.push_rtp(AUDIO_RTP_CHANNEL, packet)
-
-        self._session.set_packet_handlers(on_video=_on_video, on_audio=_on_audio)
+        try:
+            await self._coordinator.attach_rtsp_session(sess)
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.exception(
+                "[abb] camera %s: failed to open stream session "
+                "camera_index=%s: %s",
+                self._attr_name,
+                self._camera_index if self._camera_index is not None else "default",
+                err,
+            )
+            return
         _LOGGER.info(
             "[abb] camera %s: PLAY started, forwarding RTP to RTSP client "
-            "camera_index=%s rtsp_sessions=%d",
+            "camera_index=%s rtsp_sessions=%d stream_clients=%d",
             self._attr_name,
             self._camera_index if self._camera_index is not None else "default",
             self._rtsp.session_count,
+            self._coordinator.client_count,
         )
+        self.async_write_ha_state()
 
     async def _on_rtsp_teardown(self, sess: RtspSession) -> None:
         _LOGGER.info(
@@ -649,24 +1054,10 @@ class ABBWelcomeCamera(Camera):
             self._attr_name,
             self._camera_index if self._camera_index is not None else "default",
             self._rtsp.session_count,
-            self._session.active,
+            self._coordinator.active,
         )
-        if self._rtsp.session_count == 0:
-            self._session.set_packet_handlers(on_video=None, on_audio=None)
-            self.hass.async_create_task(self._delayed_session_close())
-
-    async def _delayed_session_close(self) -> None:
-        try:
-            await asyncio.sleep(_TEARDOWN_GRACE_SECONDS)
-        except asyncio.CancelledError:
-            return
-        if self._rtsp.session_count > 0:
-            return
-        async with self._stream_lock:
-            if self._rtsp.session_count > 0:
-                return
-            if self._session.active:
-                await self._session.close()
+        self._coordinator.detach_rtsp_session(sess)
+        self.async_write_ha_state()
 
     # ------------------------------------------------------------------ #
     # stream_source for non-WebRTC consumers                             #
@@ -675,12 +1066,91 @@ class ABBWelcomeCamera(Camera):
     async def stream_source(self) -> str | None:
         if _go2rtc_url(self.hass) is None:
             return None
-        return f"rtsp://127.0.0.1:18554/{self._stream_name}"
+        return f"rtsp://{GO2RTC_RTSP_HOST}:{GO2RTC_RTSP_PORT}/{self._stream_name}"
+
+    @property
+    def talkback_ready(self) -> bool:
+        return self._coordinator.talkback_ready
+
+    @property
+    def talkback_stats(self) -> dict[str, Any]:
+        return self._coordinator.talkback_stats()
+
+    def talkback_target_score(self) -> tuple[int, int, int]:
+        """Sort active/current talkback targets ahead of idle sub-cameras."""
+        return (
+            0 if self._coordinator.talkback_ready else 1,
+            0 if self._coordinator.active else 1,
+            0 if self._camera_index is None else 1,
+        )
+
+    async def async_talkback_start(
+        self,
+        talkback_session_id: str = "",
+    ) -> dict[str, Any]:
+        stats = self._coordinator.start_talkback(talkback_session_id)
+        self.async_write_ha_state()
+        return stats
+
+    async def async_talkback_stop(
+        self,
+        talkback_session_id: str = "",
+    ) -> dict[str, Any]:
+        stats = self._coordinator.stop_talkback(talkback_session_id)
+        self.async_write_ha_state()
+        return stats
+
+    async def async_talkback_pcm16le(
+        self,
+        pcm: bytes,
+        talkback_session_id: str = "",
+    ) -> dict[str, Any]:
+        stats = self._coordinator.feed_talkback_pcm16le(
+            pcm,
+            talkback_session_id,
+        )
+        self.async_write_ha_state()
+        return stats
+
+    async def async_talkback_tone(
+        self,
+        *,
+        duration_ms: int = 1200,
+        frequency_hz: int = 880,
+        amplitude: float = 0.35,
+        talkback_session_id: str = "",
+    ) -> dict[str, Any]:
+        stats = await self._coordinator.send_talkback_tone(
+            duration_ms=duration_ms,
+            frequency_hz=frequency_hz,
+            amplitude=amplitude,
+            session_id=talkback_session_id,
+        )
+        self.async_write_ha_state()
+        return stats
 
     async def async_camera_image(
         self, width: int | None = None, height: int | None = None
     ) -> bytes | None:
-        return None
+        snapshot = self._station_screenshot()
+        return snapshot.image_data if snapshot else None
+
+    def _station_screenshot(self):
+        station_id = str(self._door.station_id or "").strip()
+        if not station_id:
+            return None
+        entry_data = self.hass.data.get(DOMAIN, {}).get(self._entry_id) or {}
+        coordinator = entry_data.get("coordinator")
+        data = getattr(coordinator, "data", None)
+        if data is None:
+            return None
+        return data.latest_screenshots_by_station.get(station_id)
+
+    def _station_id(self) -> str:
+        return str(self._door.station_id or "").strip()
+
+    def _stream_allowed(self) -> bool:
+        return is_stream_allowed(self.hass, self._entry_id, self._station_id())
 
     # ------------------------------------------------------------------ #
     # WebRTC offer / candidate forwarding to go2rtc                      #
@@ -694,20 +1164,22 @@ class ABBWelcomeCamera(Camera):
     ) -> None:
         _LOGGER.info(
             "[abb] camera %s: WebRTC offer session_id=%s armed=%s "
-            "camera_index=%s stream=%s",
+            "allowed=%s camera_index=%s stream=%s",
             self._attr_name,
             session_id,
             is_armed(self.hass, self._entry_id),
+            self._stream_allowed(),
             self._camera_index if self._camera_index is not None else "default",
             self._stream_name,
         )
-        if not is_armed(self.hass, self._entry_id):
+        if not self._stream_allowed():
             send_message(
                 WebRTCError(
                     code="abb_streaming_disarmed",
                     message=(
                         "ABB Welcome streaming is disarmed. "
-                        "Toggle the streaming switch on, or wait for an inbound ring."
+                        "Toggle the streaming switch on for this station, "
+                        "or wait for an inbound ring."
                     ),
                 )
             )

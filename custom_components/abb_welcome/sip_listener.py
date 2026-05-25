@@ -9,10 +9,11 @@ distinct ``Contact`` URI from :mod:`sip_client`, so unlock requests and
 incoming-call notifications coexist as independent SIP bindings on the
 gateway.
 
-It is deliberately a **purely passive** observer: it sends only a
-``100 Trying`` (an informational hop-by-hop ack that doesn't accept or
-reject the call) and otherwise stays silent on the INVITE so the
-gateway keeps forking to indoor stations and other apps unaffected.
+By default it observes incoming calls without accepting them.  When a
+camera consumer opens the stream while a matching INVITE is pending, the
+media pipeline can ask this listener to answer that exact call with a
+``200 OK`` SDP answer, avoiding the busy/loopback problem caused by
+actively dialing the outdoor station while it is already calling us.
 ``CANCEL`` from the gateway (someone else picked up, or timeout) is
 acknowledged properly with ``200 OK`` + ``487 Request Terminated`` so
 the dialog closes without leaking transactions.
@@ -29,8 +30,10 @@ import time
 import uuid
 import warnings
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, TYPE_CHECKING
+
+from .intercom_dialer import ParsedSdp, parse_sdp
 
 if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
@@ -61,6 +64,35 @@ class IncomingCall:
     cseq: str
     raw_invite: bytes
     received_at: float
+
+
+@dataclass
+class AcceptedIncomingCall:
+    """A door-station originated INVITE that HA has answered."""
+
+    caller_uri: str
+    caller_user: str
+    call_id: str
+    local_tag: str
+    remote_tag: str
+    invite_cseq: int
+    remote_contact: str
+    local_contact: str
+    from_header: str
+    to_header: str
+    remote_sdp: ParsedSdp
+    audio_local_port: int
+    video_local_port: int
+    ack_received: bool = False
+
+
+@dataclass
+class _AcceptedDialog:
+    call: AcceptedIncomingCall
+    ack_received: bool = False
+    ack_event: asyncio.Event = field(default_factory=asyncio.Event)
+    ended_event: asyncio.Event = field(default_factory=asyncio.Event)
+    end_reason: str = ""
 
 
 RingCallback = Callable[[IncomingCall], Awaitable[None] | None]
@@ -177,6 +209,88 @@ def _user_from_uri(uri: str) -> str:
     return ""
 
 
+def _tag_from_header(value: str) -> str:
+    match = re.search(r"(?:^|[;\s])tag=([^;>\s]+)", value)
+    return match.group(1) if match else ""
+
+
+def _contact_uri(value: str) -> str:
+    match = re.search(r"<([^>]+)>", value)
+    if match:
+        return match.group(1)
+    return value.strip()
+
+
+def _cseq_number(value: str) -> int:
+    try:
+        return int(value.split()[0])
+    except (IndexError, ValueError):
+        return 1
+
+
+def _preferred_payload(
+    offer: ParsedSdp,
+    media: str,
+    preferred: tuple[str, ...],
+) -> tuple[int, str, str | None, str] | None:
+    for desc in offer.medias:
+        if desc.media != media:
+            continue
+        for codec in preferred:
+            for pt in desc.payload_types:
+                rtpmap = desc.rtpmap.get(pt, "")
+                if codec.lower() in rtpmap.lower():
+                    return pt, rtpmap, desc.fmtp.get(pt), desc.proto or "RTP/AVP"
+        if desc.payload_types:
+            pt = desc.payload_types[0]
+            return pt, desc.rtpmap.get(pt, ""), desc.fmtp.get(pt), desc.proto or "RTP/AVP"
+    return None
+
+
+def _build_answer_sdp(
+    offer: ParsedSdp,
+    *,
+    username: str,
+    media_ip: str,
+    audio_port: int,
+    video_port: int,
+) -> str:
+    """Build a conservative SDP answer for an incoming door-station INVITE."""
+    sid = int(time.time() * 1000)
+    lines = [
+        "v=0",
+        f"o={username} {sid} {sid} IN IP4 {media_ip}",
+        "s=Talk",
+        f"c=IN IP4 {media_ip}",
+        "b=AS:380",
+        "t=0 0",
+    ]
+
+    audio = _preferred_payload(offer, "audio", ("PCMA/8000", "PCMU/8000"))
+    if audio is not None:
+        pt, rtpmap, _fmtp, proto = audio
+        lines.extend([
+            f"m=audio {audio_port} {proto} {pt}",
+            f"a=rtpmap:{pt} {rtpmap or 'PCMA/8000'}",
+            "a=ptime:20",
+            "a=sendrecv",
+        ])
+
+    video = _preferred_payload(offer, "video", ("H264/90000",))
+    if video is not None:
+        pt, rtpmap, fmtp, proto = video
+        lines.extend([
+            f"m=video {video_port} {proto} {pt}",
+            f"a=rtpmap:{pt} {rtpmap or 'H264/90000'}",
+        ])
+        if fmtp:
+            lines.append(f"a=fmtp:{pt} {fmtp}")
+        lines.append("a=sendrecv")
+
+    lines.append("")
+    return "\r\n".join(lines)
+
+
 def _parse_challenge(value: str) -> dict[str, str]:
     params: dict[str, str] = {}
     for match in re.finditer(r'(\w+)\s*=\s*"?([^",]+)"?', value):
@@ -267,6 +381,10 @@ class SipListener:
         self._state = "stopped"
         # Map Call-ID -> last INVITE frame so CANCEL can echo the right Vias.
         self._open_invites: dict[str, _SipFrame] = {}
+        self._accepted_dialogs: dict[str, _AcceptedDialog] = {}
+        self._ended_dialog_reasons: dict[str, str] = {}
+        self._dialog_cseq = 1
+        self._dialog_lock = asyncio.Lock()
 
     # ----- Public lifecycle -----
 
@@ -274,6 +392,157 @@ class SipListener:
     def state(self) -> str:
         """Current high-level state: stopped / connecting / registered / disconnected."""
         return self._state
+
+    def pending_call_for_station(self, station_id: str) -> bool:
+        """Return whether an unanswered INVITE is pending for this station."""
+        station_id = str(station_id or "").strip()
+        now = time.time()
+        pending = 0
+        for call_id, frame in list(self._open_invites.items()):
+            if now - self._invite_received_at(frame) > 45:
+                self._open_invites.pop(call_id, None)
+                continue
+            pending += 1
+            if self._frame_station_id(frame) == station_id:
+                return True
+        return pending == 1
+
+    async def accept_pending_call(
+        self,
+        *,
+        station_id: str,
+        media_ip: str,
+        audio_port: int,
+        video_port: int,
+    ) -> AcceptedIncomingCall | None:
+        """Answer a pending door-station INVITE with local RTP ports."""
+        async with self._dialog_lock:
+            if self._writer is None or self._writer.is_closing():
+                return None
+            frame = self._pop_pending_invite(station_id)
+            if frame is None:
+                return None
+
+            call_id = _header(frame.headers, "Call-ID")
+            offer = parse_sdp(frame.body)
+            answer = _build_answer_sdp(
+                offer,
+                username=self.username,
+                media_ip=media_ip,
+                audio_port=audio_port,
+                video_port=video_port,
+            )
+            local_tag = uuid.uuid4().hex[:8]
+            local_contact = (
+                f"<sip:{self.username}@{self._local_ip}:{self._local_port};"
+                f"transport={self.transport}>"
+            )
+            from_header = _header(frame.headers, "From")
+            to_header = _header(frame.headers, "To")
+            to_with_tag = (
+                to_header if ";tag=" in to_header else f"{to_header};tag={local_tag}"
+            )
+            remote_contact = _contact_uri(_header(frame.headers, "Contact"))
+            caller_match = re.search(r"<([^>]+)>", from_header)
+            caller_uri = caller_match.group(1) if caller_match else from_header
+            accepted = AcceptedIncomingCall(
+                caller_uri=caller_uri,
+                caller_user=_user_from_uri(caller_uri),
+                call_id=call_id,
+                local_tag=local_tag,
+                remote_tag=_tag_from_header(from_header),
+                invite_cseq=_cseq_number(_header(frame.headers, "CSeq")),
+                remote_contact=remote_contact,
+                local_contact=local_contact,
+                from_header=from_header,
+                to_header=to_with_tag,
+                remote_sdp=offer,
+                audio_local_port=audio_port,
+                video_local_port=video_port,
+            )
+            dialog = _AcceptedDialog(call=accepted)
+            self._ended_dialog_reasons.pop(call_id, None)
+            self._accepted_dialogs[call_id] = dialog
+            await self._respond(
+                self._writer,
+                frame,
+                200,
+                "OK",
+                to_tag=local_tag,
+                extra_headers=[
+                    f"Contact: {local_contact}",
+                    (
+                        "Allow: INVITE, ACK, CANCEL, OPTIONS, MESSAGE, INFO, REFER, "
+                        "BYE, NOTIFY, PRACK, UPDATE, SUBSCRIBE"
+                    ),
+                    "Supported: replaces, outbound",
+                    "Content-Type: application/sdp",
+                ],
+                body=answer,
+            )
+            _LOGGER.info(
+                "[abb] Accepted incoming call station=%s call_id=%s "
+                "audio_port=%d video_port=%d",
+                station_id,
+                call_id,
+                audio_port,
+                video_port,
+            )
+        try:
+            await asyncio.wait_for(dialog.ack_event.wait(), timeout=3.0)
+            accepted.ack_received = True
+            _LOGGER.info("[abb] Incoming call ACK received call_id=%s", call_id)
+        except asyncio.TimeoutError:
+            _LOGGER.warning(
+                "[abb] Incoming call ACK not received within timeout call_id=%s; "
+                "continuing media setup",
+                call_id,
+            )
+        if dialog.ended_event.is_set():
+            _LOGGER.warning(
+                "[abb] Incoming call ended while waiting for ACK call_id=%s reason=%s",
+                call_id,
+                dialog.end_reason,
+            )
+            return None
+        accepted.ack_received = dialog.ack_received
+        return accepted
+
+    async def wait_accepted_call_end(self, call_id: str) -> str:
+        """Wait until an accepted incoming call ends; return the end reason."""
+        dialog = self._accepted_dialogs.get(call_id)
+        if dialog is None:
+            return self._ended_dialog_reasons.get(call_id, "not_found")
+        await dialog.ended_event.wait()
+        return dialog.end_reason or "ended"
+
+    async def hangup_accepted_call(self, call_id: str) -> None:
+        """Send BYE for an incoming call previously accepted by this listener."""
+        async with self._dialog_lock:
+            dialog = self._accepted_dialogs.get(call_id)
+            if dialog is None or self._writer is None or self._writer.is_closing():
+                return
+            call = dialog.call
+            target = call.remote_contact or call.caller_uri
+            branch = "z9hG4bK-" + uuid.uuid4().hex[:12]
+            cseq = self._dialog_cseq
+            self._dialog_cseq += 1
+            headers = [
+                (
+                    f"Via: SIP/2.0/{self.transport.upper()} "
+                    f"{self._local_ip}:{self._local_port};branch={branch};rport"
+                ),
+                "Max-Forwards: 70",
+                f"From: {call.to_header}",
+                f"To: {call.from_header}",
+                f"Call-ID: {call.call_id}",
+                f"CSeq: {cseq} BYE",
+                f"Contact: {call.local_contact}",
+                f"User-Agent: {USER_AGENT}",
+            ]
+            await self._send_request(self._writer, "BYE", target, headers, "")
+            self._finish_accepted_dialog(call_id, "local_bye")
+            _LOGGER.info("[abb] Sent BYE for accepted incoming call %s", call_id)
 
     def start(self, hass: "HomeAssistant" | None = None) -> None:
         """Schedule the listener loop.  Idempotent.
@@ -317,6 +586,8 @@ class SipListener:
             except (OSError, ssl.SSLError):
                 pass
             self._writer = None
+        for call_id in list(self._accepted_dialogs):
+            self._finish_accepted_dialog(call_id, "listener_stopped")
         if self._task is not None:
             self._task.cancel()
             try:
@@ -403,6 +674,8 @@ class SipListener:
         finally:
             self._reader = None
             self._writer = None
+            for call_id in list(self._accepted_dialogs):
+                self._finish_accepted_dialog(call_id, "listener_disconnected")
             try:
                 writer.close()
                 await writer.wait_closed()
@@ -538,11 +811,24 @@ class SipListener:
             await self._respond(writer, frame, 200, "OK")
             invite = self._open_invites.pop(_header(frame.headers, "Call-ID"), None)
             if invite is not None:
-                await self._respond(writer, invite, 487, "Request Terminated", with_to_tag=True)
+                await self._respond(
+                    writer, invite, 487, "Request Terminated", with_to_tag=True
+                )
+            else:
+                _LOGGER.info(
+                    "[abb] CANCEL for non-pending call_id=%s",
+                    _header(frame.headers, "Call-ID"),
+                )
         elif method == "BYE":
+            self._finish_accepted_dialog(_header(frame.headers, "Call-ID"), "remote_bye")
             await self._respond(writer, frame, 200, "OK")
         elif method == "ACK":
-            pass  # ACKs are fire-and-forget
+            dialog = self._accepted_dialogs.get(_header(frame.headers, "Call-ID"))
+            if dialog is not None:
+                dialog.ack_received = True
+                dialog.call.ack_received = True
+                dialog.ack_event.set()
+            # ACKs are fire-and-forget.
         elif frame.is_response:
             # Stray response for a transaction we no longer track — ignore.
             _LOGGER.debug(
@@ -604,6 +890,9 @@ class SipListener:
         reason: str,
         *,
         with_to_tag: bool = False,
+        to_tag: str | None = None,
+        extra_headers: list[str] | None = None,
+        body: str = "",
     ) -> None:
         lines = [f"SIP/2.0 {code} {reason}"]
         out_headers: list[tuple[str, str]] = []
@@ -615,8 +904,8 @@ class SipListener:
         lines.append(f"From: {from_value}")
         out_headers.append(("From", from_value))
         to_value = _header(frame.headers, "To")
-        if with_to_tag and ";tag=" not in to_value:
-            to_value = f"{to_value};tag={uuid.uuid4().hex[:8]}"
+        if (with_to_tag or to_tag) and ";tag=" not in to_value:
+            to_value = f"{to_value};tag={to_tag or uuid.uuid4().hex[:8]}"
         lines.append(f"To: {to_value}")
         out_headers.append(("To", to_value))
         call_id = _header(frame.headers, "Call-ID")
@@ -627,10 +916,17 @@ class SipListener:
         out_headers.append(("CSeq", cseq))
         lines.append(f"User-Agent: {USER_AGENT}")
         out_headers.append(("User-Agent", USER_AGENT))
-        lines.append("Content-Length: 0")
-        out_headers.append(("Content-Length", "0"))
+        if extra_headers:
+            for header in extra_headers:
+                lines.append(header)
+                if ":" in header:
+                    key, value = header.split(":", 1)
+                    out_headers.append((key.strip(), value.strip()))
+        body_bytes = body.encode("utf-8")
+        lines.append(f"Content-Length: {len(body_bytes)}")
+        out_headers.append(("Content-Length", str(len(body_bytes))))
         lines.append("")
-        lines.append("")
+        lines.append(body)
         wire = "\r\n".join(lines).encode("utf-8")
         writer.write(wire)
         await writer.drain()
@@ -639,10 +935,52 @@ class SipListener:
             _SipFrame(
                 start_line=f"SIP/2.0 {code} {reason}",
                 headers=out_headers,
-                body=b"",
+                body=body_bytes,
                 raw=wire,
             ),
         )
+
+    def _invite_received_at(self, frame: "_SipFrame") -> float:
+        try:
+            return float(getattr(frame, "_received_at", 0.0))
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _frame_station_id(self, frame: "_SipFrame") -> str:
+        from_header = _header(frame.headers, "From")
+        station = _user_from_uri(from_header)
+        if station:
+            return station
+        if " " in frame.start_line:
+            return _user_from_uri(frame.start_line.split(" ", 2)[1])
+        return ""
+
+    def _pop_pending_invite(self, station_id: str) -> "_SipFrame | None":
+        station_id = str(station_id or "").strip()
+        now = time.time()
+        fallback: _SipFrame | None = None
+        for call_id, frame in list(self._open_invites.items()):
+            if now - self._invite_received_at(frame) > 45:
+                self._open_invites.pop(call_id, None)
+                continue
+            if self._frame_station_id(frame) == station_id:
+                return self._open_invites.pop(call_id)
+            if fallback is None:
+                fallback = frame
+        if fallback is not None and len(self._open_invites) == 1:
+            call_id = _header(fallback.headers, "Call-ID")
+            return self._open_invites.pop(call_id, None)
+        return None
+
+    def _finish_accepted_dialog(self, call_id: str, reason: str) -> None:
+        dialog = self._accepted_dialogs.pop(call_id, None)
+        self._ended_dialog_reasons[call_id] = reason
+        while len(self._ended_dialog_reasons) > 20:
+            self._ended_dialog_reasons.pop(next(iter(self._ended_dialog_reasons)))
+        if dialog is None:
+            return
+        dialog.end_reason = reason
+        dialog.ended_event.set()
 
     async def _send_request(
         self,
@@ -692,7 +1030,9 @@ class SipListener:
             length = int(cl_match.group(1))
             if length > 0:
                 body = await reader.readexactly(length)
-        return _SipFrame(start_line=start_line, headers=headers, body=body, raw=head + body)
+        frame = _SipFrame(start_line=start_line, headers=headers, body=body, raw=head + body)
+        setattr(frame, "_received_at", time.time())
+        return frame
 
     async def _read_final_response(self, reader: asyncio.StreamReader) -> "_SipFrame":
         while True:

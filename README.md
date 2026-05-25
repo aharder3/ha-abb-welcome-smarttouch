@@ -14,9 +14,9 @@ complete in well under 100 ms.
 
 - One Home Assistant **button entity per unlock-capable outdoor station** (Outdoor 1 / Inner / Parking, etc.).
 - **WebRTC camera entities** for discovered outdoor stations, backed by HA's bundled go2rtc.
-- **LAN H.264 video + PCMA/G.711 audio** for live intercom streams. Audio is the door-station microphone downlink; two-way talkback is not implemented in this integration yet.
+- **LAN H.264 video + PCMA/G.711 audio** for live intercom streams. The integration also exposes PCMA talkback services for the currently active call; HomeKit microphone support is provided through the included Scrypted bridge.
 - **Streaming enabled switch** to explicitly arm live streaming. Intercom video/audio is building-wide exclusive, so streams do not start accidentally from frontend prefetches or HomeKit probes.
-- **Auto-arm on ring** — when the SIP listener sees an incoming doorbell INVITE, streaming is enabled briefly so opening the camera from the notification can start immediately.
+- **Allow pickup switch** — when enabled, an incoming SIP INVITE briefly arms streaming so opening the camera from the notification can pick up the ringing station. When disabled, rings force streaming off so phones and indoor stations can answer safely.
 - **Image entity** with the latest doorbell screenshot. The gateway only captures a frame when someone rings, so `image_last_updated` reflects the actual ring time, not a polling timestamp.
 - **Realtime ring binary_sensor** — passively listens on the gateway's local SIP port and fires within tens of milliseconds of someone pressing the doorbell. Also emits an `abb_welcome_ring` event on the HA bus with caller URI, call id, station id, and configured station name for automations. Does not interfere with the indoor stations or the official ABB app.
 - **Refresh Events** button — forces a portal poll if you don't want to wait for the next 30 s tick.
@@ -102,8 +102,9 @@ The integration also creates:
 
 - `camera.<gateway>_<door_name>` — live intercom stream for each discovered station.
 - `switch.<gateway>_streaming_enabled` — arms streaming for a short window; switching it off tears down any active stream.
+- `switch.<gateway>_allow_pickup` — allows HA/Scrypted/HomeKit streams to accept an incoming doorbell call. Turning it off leaves manual proactive streaming available outside a ring, but refuses pending INVITE pickup.
 - `binary_sensor.<gateway>_intercom_ringing` — turns on briefly when a SIP INVITE/ring is observed.
-- `image.<gateway>_latest_screenshot` — latest gateway screenshot from the portal event history.
+- `image.<gateway>_latest_screenshot` — latest gateway screenshot from the portal event history. Camera snapshots use station-matched cached screenshots when the portal events can be correlated safely.
 - `event.<gateway>_intercom` — event entity for ring / call / door-open history.
 - `sensor.<gateway>_last_event` — latest non-screenshot portal event with detailed attributes.
 - `sensor.<gateway>_sip_listener` — diagnostic state for the realtime SIP listener.
@@ -119,16 +120,20 @@ To view a stream manually:
 2. Open the desired `camera.<gateway>_<door_name>` within the armed window.
 3. The integration dials the gateway locally and passes H.264 video plus PCMA audio to HA/go2rtc/WebRTC.
 
-When someone rings, the integration auto-arms streaming for a short window so a
-camera opened from the ring notification can start without a separate manual step.
+When someone rings and `switch.<gateway>_allow_pickup` is on, the integration
+auto-arms streaming for a short window so a camera opened from the ring
+notification can pick up the pending call without a separate manual step. When
+that switch is off, the ring force-disarms streaming and the media pipeline
+refuses the pending SIP INVITE, leaving phones and indoor stations free to
+answer.
 
-Current media support is one-way: door station → Home Assistant/browser video and
-audio. Browser/HomeKit talkback is not supported yet.
+Current HA media support is door station → Home Assistant/browser video and audio.
+Talkback is exposed as HA services for the active stream; HomeKit two-way audio is
+bridged through Scrypted, which feeds microphone PCM back into those services.
 
-### Talkback prototype status
+### Talkback
 
-Two-way audio is being validated outside the integration before it is exposed in
-Home Assistant. The verified uplink mode is:
+The talkback uplink mode is:
 
 - one continuous Linphone-like audio RTP leg on the same local UDP audio port used
   for the call;
@@ -139,11 +144,32 @@ Home Assistant. The verified uplink mode is:
   and SSRC;
 - no separate local ABB mute command is required for this path.
 
-The standalone prototype has verified this against the real gateway/station: a
-2.5 s `Door opening` probe produced audible station audio with `voice=125` RTP
-packets and `dropped=0`. This is not wired into the HA integration yet; the
-stable integration intentionally remains one-way until browser/native mic input,
-lifecycle handling, and HomeKit export semantics are proven.
+The HA-native HomeKit bridge can expose the camera and ring sensor, but it does
+not expose a usable microphone path for this custom camera. Use
+`scrypted/abb-ha-doorbell` when Apple Home needs two-way audio.
+
+### Scrypted RTSP endpoint
+
+For Scrypted/HomeKit, the integration exposes HA's localhost-only go2rtc RTSP
+listener through a small LAN TCP proxy. Port selection starts at:
+
+```text
+rtsp://<home-assistant-lan-ip>:18556/<go2rtc_stream>
+```
+
+`<go2rtc_stream>` is shown on each camera entity as the `go2rtc_stream`
+attribute, and the complete current URL is exposed as `lan_rtsp_url`. On setup
+the integration tries the saved preferred port first; if that port is occupied,
+it automatically scans from `18556` upward, starts on the first free port, and
+persists that port in the entry options. A blank advertised host uses Home
+Assistant's configured internal/external URL first, then falls back to the local
+source address used to reach the ABB gateway.
+
+After the camera entities are loaded, the integration fires
+`abb_welcome_discovery_changed` on Home Assistant's event bus with the current
+proxy host, port, running state, and change reason. The Scrypted bridge subscribes
+to only this ABB event over HA WebSocket so it can refresh `lan_rtsp_url` without
+listening to every entity's `state_changed` event.
 
 ### Realtime ring event payload
 

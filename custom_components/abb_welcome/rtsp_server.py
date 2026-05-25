@@ -58,6 +58,13 @@ class RtspSession:
     has_audio: bool = False
     playing: bool = False
 
+    def close(self) -> None:
+        """Close this RTSP client connection."""
+        try:
+            self.writer.close()
+        except Exception:  # noqa: BLE001
+            pass
+
     def push_rtp(self, channel: int, rtp_data: bytes) -> bool:
         """Frame + send one RTP packet on the established TCP connection."""
         if self.writer.is_closing():
@@ -225,6 +232,12 @@ class RtspServer:
                             "Session": f"{session_id};timeout=60",
                         },
                     )
+                    _LOGGER.info(
+                        "[abb-rtsp] SETUP peer=%s session=%s cseq=%s "
+                        "interleaved=%s has_video=%s has_audio=%s",
+                        peer, session_id, cseq, interleaved,
+                        sess.has_video, sess.has_audio,
+                    )
                     continue
 
                 if method == "PLAY":
@@ -240,6 +253,11 @@ class RtspServer:
                         writer, write_lock, 200, "OK",
                         {"CSeq": cseq, "Session": session_id},
                     )
+                    _LOGGER.info(
+                        "[abb-rtsp] PLAY peer=%s session=%s cseq=%s "
+                        "has_video=%s has_audio=%s",
+                        peer, session_id, cseq, sess.has_video, sess.has_audio,
+                    )
                     try:
                         await self._on_play(sess)
                     except Exception as err:  # noqa: BLE001
@@ -249,6 +267,10 @@ class RtspServer:
                     continue
 
                 if method == "TEARDOWN":
+                    _LOGGER.info(
+                        "[abb-rtsp] TEARDOWN peer=%s session=%s cseq=%s",
+                        peer, session_id or "", cseq,
+                    )
                     await self._send_response(
                         writer, write_lock, 200, "OK",
                         {"CSeq": cseq, "Session": session_id or ""},

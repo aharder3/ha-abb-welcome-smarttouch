@@ -36,3 +36,197 @@ refresh_doors:
       required: false
       selector:
         text:
+
+arm_streaming:
+  name: Arm streaming
+  description: >-
+    Arm ABB Welcome streaming for a short window. Supplying station_id restricts
+    the armed window to that outdoor station so HomeKit/Scrypted snapshot probes
+    for other doorbells cannot start additional intercom calls.
+  fields:
+    entry_id:
+      name: Entry ID
+      description: Optional. Specific config-entry ID to arm. Defaults to all loaded entries.
+      required: false
+      selector:
+        text:
+    station_id:
+      name: Station ID
+      description: Optional outdoor station id allowed to open a stream.
+      required: false
+      selector:
+        text:
+    duration:
+      name: Duration
+      description: Armed window in seconds.
+      default: 180
+      required: false
+      selector:
+        number:
+          min: 5
+          max: 600
+          mode: box
+          unit_of_measurement: s
+
+talk_start:
+  name: Start talkback
+  description: >-
+    Begin sending queued microphone audio on the currently active ABB camera
+    stream's SIP/RTP audio leg. The camera stream must already be open.
+  fields:
+    entity_id:
+      name: Camera
+      description: Optional camera entity. Defaults to the active ABB camera stream.
+      required: false
+      selector:
+        entity:
+          domain: camera
+    station_id:
+      name: Station ID
+      description: Optional outdoor station id to target when no camera entity is supplied.
+      required: false
+      selector:
+        text:
+    entry_id:
+      name: Entry ID
+      description: Optional ABB Welcome config-entry id.
+      required: false
+      selector:
+        text:
+    talkback_session_id:
+      name: Talkback session ID
+      description: Optional client session id. Prevents an old client from stopping a newer talkback session.
+      required: false
+      selector:
+        text:
+
+talk_stop:
+  name: Stop talkback
+  description: Stop sending queued microphone audio and return the talkback leg to silence.
+  fields:
+    entity_id:
+      name: Camera
+      description: Optional camera entity. Defaults to the active ABB camera stream.
+      required: false
+      selector:
+        entity:
+          domain: camera
+    station_id:
+      name: Station ID
+      description: Optional outdoor station id to target when no camera entity is supplied.
+      required: false
+      selector:
+        text:
+    entry_id:
+      name: Entry ID
+      description: Optional ABB Welcome config-entry id.
+      required: false
+      selector:
+        text:
+    talkback_session_id:
+      name: Talkback session ID
+      description: Optional client session id. Only the matching owner may stop talkback.
+      required: false
+      selector:
+        text:
+
+talk_pcm16le:
+  name: Send talkback PCM
+  description: >-
+    Queue base64-encoded 8 kHz mono signed 16-bit little-endian PCM samples on
+    the active talkback leg. Call talk_start before sending PCM.
+  fields:
+    entity_id:
+      name: Camera
+      description: Optional camera entity. Defaults to the active ABB camera stream.
+      required: false
+      selector:
+        entity:
+          domain: camera
+    station_id:
+      name: Station ID
+      description: Optional outdoor station id to target when no camera entity is supplied.
+      required: false
+      selector:
+        text:
+    entry_id:
+      name: Entry ID
+      description: Optional ABB Welcome config-entry id.
+      required: false
+      selector:
+        text:
+    talkback_session_id:
+      name: Talkback session ID
+      description: Optional client session id. PCM from stale sessions is ignored.
+      required: false
+      selector:
+        text:
+    pcm16le:
+      name: PCM16LE
+      description: Base64-encoded 8 kHz mono signed 16-bit little-endian PCM.
+      required: true
+      selector:
+        text:
+
+talk_tone:
+  name: Send talkback tone
+  description: Send a short generated tone through the active talkback leg for testing.
+  fields:
+    entity_id:
+      name: Camera
+      description: Optional camera entity. Defaults to the active ABB camera stream.
+      required: false
+      selector:
+        entity:
+          domain: camera
+    station_id:
+      name: Station ID
+      description: Optional outdoor station id to target when no camera entity is supplied.
+      required: false
+      selector:
+        text:
+    entry_id:
+      name: Entry ID
+      description: Optional ABB Welcome config-entry id.
+      required: false
+      selector:
+        text:
+    talkback_session_id:
+      name: Talkback session ID
+      description: Optional client session id. Tone requests from stale sessions are ignored.
+      required: false
+      selector:
+        text:
+    duration_ms:
+      name: Duration
+      description: Tone duration in milliseconds.
+      default: 1200
+      required: false
+      selector:
+        number:
+          min: 100
+          max: 5000
+          mode: box
+          unit_of_measurement: ms
+    frequency_hz:
+      name: Frequency
+      description: Tone frequency in hertz.
+      default: 880
+      required: false
+      selector:
+        number:
+          min: 100
+          max: 3000
+          mode: box
+          unit_of_measurement: Hz
+    amplitude:
+      name: Amplitude
+      description: Tone amplitude from 0.0 to 1.0.
+      default: 0.35
+      required: false
+      selector:
+        number:
+          min: 0
+          max: 1
+          step: 0.05
+          mode: slider

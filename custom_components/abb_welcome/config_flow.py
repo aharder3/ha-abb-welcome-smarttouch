@@ -20,9 +20,14 @@ from homeassistant.helpers import selector
 from .const import (
     CONF_ABB_PASSWORD,
     CONF_ABB_USERNAME,
+    CONF_ALLOW_PICKUP,
     CONF_GATEWAY_IP,
     CONF_GATEWAY_UUID_OVERRIDE,
+    CONF_LAN_RTSP_HOST,
+    CONF_LAN_RTSP_PORT,
     CONF_UNLOCK_STRATEGY,
+    DEFAULT_ALLOW_PICKUP,
+    DEFAULT_LAN_RTSP_PORT,
     DEFAULT_UNLOCK_STRATEGY,
     DOMAIN,
     UNLOCK_STRATEGIES,
@@ -407,10 +412,25 @@ class ABBWelcomeOptionsFlow(OptionsFlow):
         self, user_input: dict | None = None
     ) -> ConfigFlowResult:
         if user_input is not None:
-            return self.async_create_entry(title="", data=user_input)
+            data = dict(user_input)
+            data[CONF_LAN_RTSP_HOST] = str(
+                data.get(CONF_LAN_RTSP_HOST) or ""
+            ).strip()
+            data[CONF_LAN_RTSP_PORT] = int(
+                data.get(CONF_LAN_RTSP_PORT) or DEFAULT_LAN_RTSP_PORT
+            )
+            return self.async_create_entry(title="", data=data)
 
         current = self._entry.options.get(
             CONF_UNLOCK_STRATEGY, DEFAULT_UNLOCK_STRATEGY
+        )
+        current_rtsp_host = self._entry.options.get(CONF_LAN_RTSP_HOST, "")
+        current_rtsp_port = int(
+            self._entry.options.get(CONF_LAN_RTSP_PORT, DEFAULT_LAN_RTSP_PORT)
+            or DEFAULT_LAN_RTSP_PORT
+        )
+        current_allow_pickup = bool(
+            self._entry.options.get(CONF_ALLOW_PICKUP, DEFAULT_ALLOW_PICKUP)
         )
         schema = vol.Schema(
             {
@@ -421,6 +441,15 @@ class ABBWelcomeOptionsFlow(OptionsFlow):
                         mode=selector.SelectSelectorMode.DROPDOWN,
                     )
                 ),
+                vol.Optional(
+                    CONF_LAN_RTSP_HOST, default=current_rtsp_host
+                ): selector.TextSelector(),
+                vol.Required(
+                    CONF_LAN_RTSP_PORT, default=current_rtsp_port
+                ): vol.All(vol.Coerce(int), vol.Range(min=1024, max=65535)),
+                vol.Required(
+                    CONF_ALLOW_PICKUP, default=current_allow_pickup
+                ): selector.BooleanSelector(),
             }
         )
         return self.async_show_form(step_id="init", data_schema=schema)
