@@ -146,7 +146,8 @@ The talkback uplink mode is:
 
 The HA-native HomeKit bridge can expose the camera and ring sensor, but it does
 not expose a usable microphone path for this custom camera. Use
-`scrypted/abb-ha-doorbell` when Apple Home needs two-way audio.
+[`abb-ha-doorbell` for Scrypted][scrypted-bridge] when Apple Home needs two-way
+audio.
 
 ### Apple Home through Scrypted
 
@@ -154,7 +155,7 @@ For a full HomeKit doorbell, use the included Scrypted bridge instead of HA's
 native HomeKit camera export:
 
 1. Configure this HA integration first and confirm the HA camera streams work.
-2. Install `scrypted/abb-ha-doorbell` in Scrypted.
+2. Install [`abb-ha-doorbell`][scrypted-bridge] in Scrypted.
 3. In the Scrypted plugin settings, enter the Home Assistant URL and a
    long-lived access token.
 4. Leave the Scrypted **Primary Door Station** setting blank unless you want a
@@ -285,3 +286,5 @@ Reports of other models or firmware versions welcome via issues.
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+[scrypted-bridge]: https://github.com/rankjie/abb-ha-doorbell
