@@ -148,6 +148,32 @@ The HA-native HomeKit bridge can expose the camera and ring sensor, but it does
 not expose a usable microphone path for this custom camera. Use
 `scrypted/abb-ha-doorbell` when Apple Home needs two-way audio.
 
+### Apple Home through Scrypted
+
+For a full HomeKit doorbell, use the included Scrypted bridge instead of HA's
+native HomeKit camera export:
+
+1. Configure this HA integration first and confirm the HA camera streams work.
+2. Install `scrypted/abb-ha-doorbell` in Scrypted.
+3. In the Scrypted plugin settings, enter the Home Assistant URL and a
+   long-lived access token.
+4. Leave the Scrypted **Primary Door Station** setting blank unless you want a
+   specific station to keep the existing `front-door` HomeKit identity.
+5. Add the Scrypted doorbells to Scrypted's HomeKit plugin.
+
+The Scrypted bridge auto-discovers stations, keeps the HomeKit video/audio
+transcode options enabled, forwards HomeKit microphone audio to HA's talkback
+services, and refreshes station/RTSP details when this integration fires
+`abb_welcome_discovery_changed`.
+
+If Apple Home uses an Apple TV or Home Hub, configure the Scrypted
+**HomeKit Pickup Safety** settings. Some hubs open a local preview immediately
+after a ring, which can occupy the exclusive ABB intercom call before a person
+answers. Assign the hub a fixed LAN IP and enter it in Scrypted if you want
+those automatic local previews blocked. Leave the IP field blank to disable
+preview blocking. Do not enable Scrypted Rebroadcast/Prebuffer for ABB doorbells
+when an Apple TV/Home Hub is present.
+
 ### Scrypted RTSP endpoint
 
 For Scrypted/HomeKit, the integration exposes HA's localhost-only go2rtc RTSP
@@ -240,6 +266,14 @@ works with **Fast**, you can leave it there for the lowest-latency setup.
 - **WebRTC says `wrong response on DESCRIBE`** — make sure `Streaming enabled` is on, then open the camera within the armed window. Version 1.3.0+ also reconnects the SIP dialer automatically if the gateway has closed an idle TLS connection.
 - **Camera has video but no audio** — use version 1.2.0-dev15 / 1.3.0 or newer. The stream exposes the gateway's PCMA/G.711 audio track through go2rtc/WebRTC.
 - **The camera stops after a short time** — this is expected if the stream consumer closes or the armed switch is turned off. Streaming is deliberately short-lived to avoid holding the building intercom media session open.
+- **Apple TV opens the doorbell preview by itself** — in Scrypted, enable
+  **Apple TV / Home Hub Present**, keep **Block Apple TV Preview Pickup** on,
+  enter the Apple TV/Home Hub fixed LAN IP, and keep Scrypted Rebroadcast/
+  Prebuffer disabled for these doorbells.
+- **HomeKit can view video but talkback does not work** — make sure the camera
+  was added through the Scrypted bridge, not only through HA's native HomeKit
+  bridge, and keep Scrypted HomeKit `Transcode Video` and `Transcode Audio`
+  enabled.
 
 ## Tested hardware
 
