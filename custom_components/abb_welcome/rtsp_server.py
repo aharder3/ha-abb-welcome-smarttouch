@@ -46,6 +46,14 @@ AUDIO_RTCP_CHANNEL: Final = 3
 
 _USER_AGENT = "ABB-Welcome-HA-RTSP-Server/1.0"
 
+# If the downstream consumer (HA-bundled go2rtc, then ffmpeg) stalls, the
+# asyncio transport's write buffer would otherwise grow without bound and
+# exhaust memory — we never drain on the RTP hot path on purpose, to avoid
+# adding latency.  Past this many buffered bytes we drop packets instead: for
+# a live doorbell stream a dropped packet is recoverable, an OOM is not.  On
+# the normal localhost loopback the buffer sits near zero, so this never fires.
+_MAX_WRITE_BUFFER_BYTES = 4 * 1024 * 1024
+
 
 @dataclass
 class RtspSession:
@@ -57,6 +65,7 @@ class RtspSession:
     has_video: bool = False
     has_audio: bool = False
     playing: bool = False
+    overflow_drops: int = 0
 
     def close(self) -> None:
         """Close this RTSP client connection."""
@@ -71,6 +80,23 @@ class RtspSession:
             return False
         if len(rtp_data) > 0xFFFF:
             return False
+        transport = self.writer.transport
+        if transport is not None:
+            try:
+                buffered = transport.get_write_buffer_size()
+            except Exception:  # noqa: BLE001
+                buffered = 0
+            if buffered > _MAX_WRITE_BUFFER_BYTES:
+                # Keep the session alive (it can catch up) but shed this packet
+                # so a stalled consumer can't grow the buffer unbounded.
+                self.overflow_drops += 1
+                if self.overflow_drops % 200 == 1:
+                    _LOGGER.warning(
+                        "[abb-rtsp] session %s consumer stalled (%d bytes "
+                        "buffered); dropping RTP (total dropped=%d)",
+                        self.session_id, buffered, self.overflow_drops,
+                    )
+                return True
         header = struct.pack("!cBH", b"$", channel, len(rtp_data))
         try:
             self.writer.write(header + rtp_data)

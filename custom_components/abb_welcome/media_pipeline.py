@@ -104,13 +104,34 @@ def _linear16_to_pcma_sample(sample: int) -> int:
     return aval ^ mask
 
 
+try:  # numpy ships with Home Assistant core; degrade gracefully if absent.
+    import numpy as _np
+except Exception:  # noqa: BLE001 - any import failure means "no fast path"
+    _np = None
+
+# A-law has only 65 536 possible 16-bit inputs, so we precompute the whole
+# mapping once from the reference scalar encoder.  The table is therefore
+# byte-for-byte identical to the per-sample implementation, but lookups are
+# branch-free.  Talkback encoding runs inside the event loop on every audio
+# chunk, so keeping it off the per-sample Python path keeps RTP forwarding for
+# the rest of the pipeline responsive.
+_ALAW_TABLE: bytes = bytes(_linear16_to_pcma_sample(s) for s in range(-32768, 32768))
+_ALAW_LUT = _np.frombuffer(_ALAW_TABLE, dtype=_np.uint8) if _np is not None else None
+
+
 def _encode_pcm16le_to_pcma(pcm: bytes) -> bytes:
-    out = bytearray(len(pcm) // 2)
-    pos = 0
-    for i in range(0, len(pcm) - 1, 2):
-        sample = int.from_bytes(pcm[i : i + 2], "little", signed=True)
-        out[pos] = _linear16_to_pcma_sample(sample)
-        pos += 1
+    n = len(pcm) // 2
+    if n == 0:
+        return b""
+    usable = pcm[: n * 2]
+    if _ALAW_LUT is not None:
+        # int16 + 32768 would overflow the int16 dtype, so widen first.
+        samples = _np.frombuffer(usable, dtype="<i2").astype(_np.int32)
+        return _ALAW_LUT[samples + 32768].tobytes()
+    table = _ALAW_TABLE
+    out = bytearray(n)
+    for i, sample in enumerate(struct.unpack("<%dh" % n, usable)):
+        out[i] = table[sample + 32768]
     return bytes(out)
 
 

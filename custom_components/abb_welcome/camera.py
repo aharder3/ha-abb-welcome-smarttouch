@@ -587,11 +587,18 @@ class StationStreamCoordinator:
             stats["ignored"] = True
             stats["ignore_reason"] = "talkback_session_owner_mismatch"
             return stats
+        owner_claimed = False
         if session_id and not self._talkback_owner:
             self._talkback_owner = session_id
+            owner_claimed = True
         stats = self.session.feed_talkback_pcm16le(pcm)
         stats["owner"] = self._talkback_owner
-        self._notify_state()
+        # The audio feed runs 10-20x/sec; writing HA entity state on every
+        # chunk floods the state machine, recorder and websocket subscribers
+        # for no benefit (the counters are diagnostics).  Only reflect real
+        # transitions — here, the first time this session claims talkback.
+        if owner_claimed:
+            self._notify_state()
         return stats
 
     async def send_talkback_tone(
@@ -1105,12 +1112,13 @@ class ABBWelcomeCamera(Camera):
         pcm: bytes,
         talkback_session_id: str = "",
     ) -> dict[str, Any]:
-        stats = self._coordinator.feed_talkback_pcm16le(
+        # No per-chunk async_write_ha_state(): the coordinator already writes
+        # state on real transitions (talk start/stop, owner claim).  Writing
+        # here too would push a full state update on every audio packet.
+        return self._coordinator.feed_talkback_pcm16le(
             pcm,
             talkback_session_id,
         )
-        self.async_write_ha_state()
-        return stats
 
     async def async_talkback_tone(
         self,
