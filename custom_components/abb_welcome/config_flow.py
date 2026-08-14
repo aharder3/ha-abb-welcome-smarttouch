@@ -30,6 +30,9 @@ from .const import (
     DEFAULT_LAN_RTSP_PORT,
     DEFAULT_UNLOCK_STRATEGY,
     DOMAIN,
+    GATEWAY_CLIENT_TYPE,
+    SMARTTOUCH_CLIENT_TYPE,
+    SIP_PORT_TLS,
     UNLOCK_STRATEGIES,
 )
 from .portal import (
@@ -38,6 +41,7 @@ from .portal import (
     compute_integrity_code,
     default_client_name,
     derive_identity,
+    discover_welcome_device,
     gateway_authorize,
     gateway_local_info,
     generate_keypair_and_csr,
@@ -77,7 +81,7 @@ STEP_USER_DATA_SCHEMA = vol.Schema(
             selector.TextSelectorConfig(type=selector.TextSelectorType.PASSWORD)
         ),
         vol.Required(CONF_GATEWAY_IP): str,
-        vol.Required(CONF_GATEWAY_PASSWORD): selector.TextSelector(
+        vol.Optional(CONF_GATEWAY_PASSWORD, default=""): selector.TextSelector(
             selector.TextSelectorConfig(type=selector.TextSelectorType.PASSWORD)
         ),
         vol.Optional(CONF_GATEWAY_UUID_OVERRIDE, default=""): str,
@@ -88,19 +92,27 @@ STEP_USER_DATA_SCHEMA = vol.Schema(
 GATEWAY_WEB_PORT = 443
 
 
-def _gateway_web_reachable(host: str, timeout: float = 5) -> bool:
-    """Return whether the gateway web admin is reachable for setup.
-
-    Pairing talks to the gateway admin CGI over HTTPS. SIP reachability is
-    important after setup, but probing SIP here can mask the real pairing error
-    (for example a broken portalclient.cgi op=6 UUID lookup) with a misleading
-    port-5060 message.
-    """
+def _port_reachable(host: str, port: int, timeout: float = 5) -> bool:
     try:
-        with socket.create_connection((host, GATEWAY_WEB_PORT), timeout=timeout):
+        with socket.create_connection((host, port), timeout=timeout):
             return True
     except OSError:
         return False
+
+
+def _gateway_web_reachable(host: str, timeout: float = 5) -> bool:
+    """Return whether the classic gateway web admin is reachable."""
+    return _port_reachable(host, GATEWAY_WEB_PORT, timeout)
+
+
+def _welcome_device_reachable(host: str, timeout: float = 5) -> bool:
+    """Accept either classic HTTPS admin or local SIP-TLS.
+
+    SmartTouch 10 exposes SIP-TLS on 5061 but no classic gateway web admin.
+    """
+    return _gateway_web_reachable(host, timeout) or _port_reachable(
+        host, SIP_PORT_TLS, timeout
+    )
 
 
 class ABBWelcomeConfigFlow(ConfigFlow, domain=DOMAIN):
@@ -129,6 +141,7 @@ class ABBWelcomeConfigFlow(ConfigFlow, domain=DOMAIN):
         self._gateway_uuid = ""
         self._gateway_uuid_override = ""
         self._gateway_name = ""
+        self._welcome_client_type = ""
         self._gateway_sid = ""
         self._fingerprint = ""
         self._integrity_eight = ""
@@ -155,7 +168,7 @@ class ABBWelcomeConfigFlow(ConfigFlow, domain=DOMAIN):
             self._username = user_input[CONF_ABB_USERNAME].strip()
             self._password = user_input[CONF_ABB_PASSWORD]
             self._gateway_ip = user_input[CONF_GATEWAY_IP].strip()
-            self._gateway_password = user_input[CONF_GATEWAY_PASSWORD]
+            self._gateway_password = user_input.get(CONF_GATEWAY_PASSWORD, "")
             uuid_raw = user_input.get(CONF_GATEWAY_UUID_OVERRIDE, "").strip().lower()
             if uuid_raw and not _UUID_RE.fullmatch(uuid_raw):
                 errors[CONF_GATEWAY_UUID_OVERRIDE] = "invalid_uuid"
@@ -163,7 +176,7 @@ class ABBWelcomeConfigFlow(ConfigFlow, domain=DOMAIN):
 
             if not errors:
                 reachable = await self.hass.async_add_executor_job(
-                    _gateway_web_reachable, self._gateway_ip
+                    _welcome_device_reachable, self._gateway_ip
                 )
                 if not reachable:
                     errors["base"] = "cannot_connect"
@@ -198,10 +211,19 @@ class ABBWelcomeConfigFlow(ConfigFlow, domain=DOMAIN):
                     _LOGGER.exception("Unexpected portal setup error: %s", err)
                     errors["base"] = "unknown"
                 else:
-                    # Phase 2: auto-approve on the gateway. By this point the
-                    # connect event was successfully sent, so the gateway has
-                    # a pending request — recoverable via the manual UI even
-                    # if our CGI calls fail.
+                    # SmartTouch panels do not expose the classic portalclient.cgi
+                    # web admin. The welcome.connect event is sufficient to put
+                    # the client into the panel pairing flow; some firmware
+                    # revisions auto-approve it, others may ask on the panel.
+                    if self._welcome_client_type == SMARTTOUCH_CLIENT_TYPE:
+                        self._manual_authorize = True
+                        self._authorize_error_msg = (
+                            "SmartTouch pairing uses the panel/MyBuildings flow; "
+                            "no classic gateway web admin is available."
+                        )
+                        return await self.async_step_manual_authorize()
+
+                    # Classic IP gateway: auto-approve via local web admin CGI.
                     try:
                         await self.hass.async_add_executor_job(
                             self._do_gateway_authorize
@@ -209,12 +231,10 @@ class ABBWelcomeConfigFlow(ConfigFlow, domain=DOMAIN):
                     except GatewayAdminError as err:
                         msg = str(err).lower()
                         if "login failed" in msg:
-                            # Wrong admin password — manual flow can't recover.
                             errors["base"] = "gateway_admin_auth_failed"
                         else:
                             _log_info(
-                                "Auto-approve failed (%s); offering manual "
-                                "approval via the gateway web UI",
+                                "Auto-approve failed (%s); offering manual approval",
                                 err,
                             )
                             self._manual_authorize = True
@@ -254,18 +274,40 @@ class ABBWelcomeConfigFlow(ConfigFlow, domain=DOMAIN):
         self._fingerprint = identity["fingerprint_sha1"]
         self._own_uuid = identity["own_portal_uuid"]
 
-        # Get the gateway UUID from the gateway itself — the portal's
-        # discovery event has a race for brand-new identities. If the user
-        # supplied an override (some firmware revisions have a broken
-        # portalclient.cgi op=6 — see GitHub issue #1), skip the local
-        # lookup entirely and trust the value they pasted in.
-        if self._gateway_uuid_override:
-            self._gateway_uuid = self._gateway_uuid_override
-            self._gateway_name = "ABB Welcome Gateway"
+        # Classic IP gateways have a local web admin and can keep the
+        # original fast/local UUID lookup. SmartTouch 10 has no such web UI,
+        # so select its ``welcome.panel`` identity from MyBuildings discovery.
+        web_reachable = _gateway_web_reachable(self._gateway_ip)
+        if web_reachable and self._gateway_password:
+            if self._gateway_uuid_override:
+                self._gateway_uuid = self._gateway_uuid_override
+                self._gateway_name = "ABB Welcome Gateway"
+            else:
+                gw_info = gateway_local_info(
+                    self._gateway_ip, self._gateway_password
+                )
+                self._gateway_uuid = gw_info["uuid"]
+                self._gateway_name = (
+                    gw_info.get("portalname") or "ABB Welcome Gateway"
+                )
+            self._welcome_client_type = GATEWAY_CLIENT_TYPE
         else:
-            gw_info = gateway_local_info(self._gateway_ip, self._gateway_password)
-            self._gateway_uuid = gw_info["uuid"]
-            self._gateway_name = gw_info.get("portalname") or "ABB Welcome Gateway"
+            device = discover_welcome_device(
+                self._portal_url,
+                self._cert_pem,
+                self._private_key_pem,
+                portal_uuid=self._gateway_uuid_override,
+            )
+            self._gateway_uuid = device["uuid"]
+            self._gateway_name = device["name"]
+            self._welcome_client_type = device["client_type"]
+            if (
+                self._welcome_client_type == GATEWAY_CLIENT_TYPE
+                and not self._gateway_password
+            ):
+                raise GatewayAdminError(
+                    "Gateway admin password required for a classic IP gateway"
+                )
 
         self._integrity_eight, self._integrity_display = compute_integrity_code(
             self._fingerprint
@@ -378,6 +420,7 @@ class ABBWelcomeConfigFlow(ConfigFlow, domain=DOMAIN):
                     "sip_domain": self._sip_domain,
                     "doors": self._doors,
                     "gateway_uuid": self._gateway_uuid,
+                    "welcome_client_type": self._welcome_client_type,
                     "own_portal_uuid": self._own_uuid,
                     "client_name": self._client_name,
                     "gateway_admin_password": self._gateway_password,

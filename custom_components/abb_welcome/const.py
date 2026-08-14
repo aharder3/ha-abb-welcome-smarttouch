@@ -12,6 +12,11 @@ DEFAULT_PORTAL_URL = "https://api.eu.mybuildings.abb.com"
 
 CLIENT_TYPE = "com.abb.ispf.client.globalip.app.abb.android"
 GATEWAY_CLIENT_TYPE = "com.abb.ispf.client.welcome.gateway"
+SMARTTOUCH_CLIENT_TYPE = "com.abb.ispf.client.welcome.panel"
+SUPPORTED_WELCOME_CLIENT_TYPES = (
+    GATEWAY_CLIENT_TYPE,
+    SMARTTOUCH_CLIENT_TYPE,
+)
 
 EVENT_TYPE_DISCOVERY = "com.abb.ispf.event.discovery"
 EVENT_TYPE_CONNECT = "com.abb.ispf.event.welcome.connect"

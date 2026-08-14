@@ -64,6 +64,8 @@ from .const import (
     EVENT_TYPE_DISCOVERY,
     GATEWAY_CLIENT_TYPE,
     GEO_URL,
+    SMARTTOUCH_CLIENT_TYPE,
+    SUPPORTED_WELCOME_CLIENT_TYPES,
 )
 from .text import decode_gateway_text, repair_utf8_mojibake
 
@@ -333,12 +335,15 @@ def _cleanup(paths: list[str]) -> None:
             pass
 
 
-def discover_gateway(
-    portal_url: str, cert_pem: bytes, key_pem: bytes
-) -> tuple[str, str]:
-    """Return (gateway_uuid, gateway_name) from the latest discovery event.
+def discover_welcome_devices(
+    portal_url: str, cert_pem: bytes, key_pem: bytes, *, event_limit: int = 5
+) -> list[dict[str, str]]:
+    """Return compatible ABB Welcome gateways/panels visible in discovery.
 
-    Raises PortalError when no gateway entry is present.
+    Both classic Welcome IP gateways and SmartTouch panels participate in the
+    same MyBuildings discovery event.  Results are de-duplicated by portal UUID
+    across the newest events because a freshly issued client identity can see
+    multiple copies of the same discovery snapshot.
     """
     session, temps = _mtls_session(cert_pem, key_pem)
     try:
@@ -346,7 +351,7 @@ def discover_gateway(
             f"{portal_url}/event",
             params={
                 "type": EVENT_TYPE_DISCOVERY,
-                "pagination_limit": 1,
+                "pagination_limit": max(1, min(int(event_limit), 20)),
                 "pagination_page": 1,
                 "order": "desc",
             },
@@ -358,29 +363,91 @@ def discover_gateway(
         if not events:
             raise PortalError(
                 "No discovery events visible — the portal account may not be "
-                "linked to any IP gateway yet."
+                "linked to an ABB Welcome IP gateway or SmartTouch panel yet."
             )
-        payload_b64 = events[0].get("payload", "")
-        pad = "=" * (-len(payload_b64) % 4)
-        entries: dict[str, dict[str, Any]] = {}
-        try:
-            import json
-            entries = json.loads(base64.b64decode(payload_b64 + pad))
-        except (ValueError, UnicodeDecodeError) as err:
-            raise PortalError(f"Could not decode discovery payload: {err}") from err
 
-        for uid, info in entries.items():
-            if info.get("type") == GATEWAY_CLIENT_TYPE:
-                return uid, repair_utf8_mojibake(
-                    str(info.get("name") or "ABB Welcome Gateway")
-                )
-        raise PortalError(
-            "Discovery event has no gateway entry "
-            f"(type={GATEWAY_CLIENT_TYPE} not found)"
-        )
+        found: dict[str, dict[str, str]] = {}
+        for event in events:
+            payload_b64 = event.get("payload", "")
+            if not payload_b64:
+                continue
+            pad = "=" * (-len(payload_b64) % 4)
+            try:
+                entries = _json.loads(base64.b64decode(payload_b64 + pad))
+            except (ValueError, UnicodeDecodeError):
+                continue
+            if not isinstance(entries, dict):
+                continue
+            for uid, info in entries.items():
+                if not isinstance(info, dict):
+                    continue
+                client_type = str(info.get("type") or "")
+                if client_type not in SUPPORTED_WELCOME_CLIENT_TYPES:
+                    continue
+                found[str(uid)] = {
+                    "uuid": str(uid),
+                    "name": repair_utf8_mojibake(
+                        str(info.get("name") or "ABB Welcome")
+                    ),
+                    "client_type": client_type,
+                }
+        return list(found.values())
     finally:
         session.close()
         _cleanup(temps)
+
+
+def discover_welcome_device(
+    portal_url: str,
+    cert_pem: bytes,
+    key_pem: bytes,
+    *,
+    portal_uuid: str = "",
+) -> dict[str, str]:
+    """Select one compatible Welcome device from MyBuildings discovery.
+
+    If multiple compatible devices exist, callers must provide ``portal_uuid``
+    so setup never silently pairs Home Assistant with the wrong building.
+    """
+    devices = discover_welcome_devices(portal_url, cert_pem, key_pem)
+    if portal_uuid:
+        wanted = portal_uuid.strip().lower()
+        for device in devices:
+            if device["uuid"].lower() == wanted:
+                return device
+        raise PortalError(
+            "The supplied Portal UUID is not present in the current ABB Welcome "
+            "discovery event."
+        )
+    if not devices:
+        raise PortalError(
+            "Discovery event has no compatible ABB Welcome IP gateway or "
+            "SmartTouch panel entry."
+        )
+    if len(devices) > 1:
+        choices = ", ".join(
+            f"{d['name']} ({d['uuid']}, {d['client_type']})" for d in devices
+        )
+        raise PortalError(
+            "Multiple compatible ABB Welcome devices are linked to this portal "
+            f"account: {choices}. Fill in the optional Portal UUID to select one."
+        )
+    return devices[0]
+
+
+def discover_gateway(
+    portal_url: str, cert_pem: bytes, key_pem: bytes
+) -> tuple[str, str]:
+    """Backward-compatible classic IP-gateway discovery helper."""
+    devices = discover_welcome_devices(portal_url, cert_pem, key_pem)
+    for device in devices:
+        if device["client_type"] == GATEWAY_CLIENT_TYPE:
+            return device["uuid"], device["name"]
+    raise PortalError(
+        "Discovery event has no classic IP gateway entry "
+        f"(type={GATEWAY_CLIENT_TYPE} not found; SmartTouch type is "
+        f"{SMARTTOUCH_CLIENT_TYPE})."
+    )
 
 
 def send_connect_event(

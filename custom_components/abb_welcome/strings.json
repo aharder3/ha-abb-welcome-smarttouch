@@ -3,18 +3,18 @@
     "step": {
       "user": {
         "title": "ABB Welcome",
-        "description": "Pair this Home Assistant instance with your ABB Welcome IP gateway.\n\nRequired fields:\n• MyBuildings portal username and password (same as the official ABB Welcome mobile app).\n• Gateway local IP address.\n• Gateway web admin password (the one used at https://gateway-ip/).\n\nOptional:\n• Gateway Portal UUID — only fill this in if the automatic setup fails (some firmware versions have a broken portal-client endpoint). You can find this value in the gateway web admin under the Portal page (label “Portal Client UUID”), or in the ABB Welcome mobile app settings. Leave blank otherwise.\n\nAfter you submit, the integration finishes pairing automatically — no need to open the gateway web admin yourself.",
+        "description": "Pair Home Assistant with an ABB Welcome IP gateway or SmartTouch panel.\n\nRequired:\n• MyBuildings portal username and password (use the portal username, not necessarily the email address).\n• Local IP address of the ABB Welcome IP device.\n\nClassic IP gateway (for example 83342): also enter the gateway web-admin password.\nSmartTouch 10: leave the gateway web-admin password blank; SmartTouch exposes SIP-TLS locally and is selected from MyBuildings discovery.\n\nOptional: Portal UUID. Use it when more than one compatible Welcome device is linked to the same MyBuildings account.",
         "data": {
           "abb_username": "Portal Username",
           "abb_password": "Portal Password",
-          "gateway_ip": "Gateway IP Address",
-          "gateway_password": "Gateway Admin Password",
-          "gateway_uuid_override": "Gateway Portal UUID (optional)"
+          "gateway_ip": "ABB Welcome device IP address",
+          "gateway_password": "Gateway admin password (classic IP gateway only)",
+          "gateway_uuid_override": "Portal UUID (optional; selects one device)"
         }
       },
       "manual_authorize": {
-        "title": "Approve pairing on the gateway",
-        "description": "Auto-approval failed, but the pairing request was sent successfully and is waiting on your gateway. Please finish the approval manually:\n\n1. Open https://{gateway_ip}/ in a browser and log in as `admin`.\n2. Navigate to the **Portal / Portal Client** page.\n3. Find the pending app named:\n\n    **{client_name}**\n\n4. When prompted for an integrity code, enter:\n\n    **{integrity_code}**\n\n5. Confirm / Approve in the gateway UI.\n6. Click **Submit** below to continue.\n\nHome Assistant will wait up to 5 minutes for the gateway to confirm the pairing.\n\n_Diagnostic detail: {error_detail}_"
+        "title": "Complete ABB Welcome pairing",
+        "description": "The pairing request was sent successfully.\n\n**SmartTouch 10:** open **System settings → Network connections → Welcome APP** and approve the new client `{client_name}` if the panel asks. Some SmartTouch firmware versions approve the request automatically.\n\n**Classic IP gateway:** open `https://{gateway_ip}/`, go to Portal / App Management, select `{client_name}`, grant the required permissions and enter integrity code **{integrity_code}**.\n\nThen click **Submit**. Home Assistant will poll MyBuildings for the signed ACL update (up to about 5 minutes).\n\nDiagnostic detail: {error_detail}"
       },
       "confirm": {
         "title": "Confirm Setup",
@@ -22,10 +22,10 @@
       }
     },
     "error": {
-      "cannot_connect": "Cannot reach the gateway web admin on HTTPS port 443. Check the IP address and that Home Assistant is on the same network.",
+      "cannot_connect": "Cannot reach the ABB Welcome device on HTTPS 443 or SIP-TLS 5061. Check the IP address and network routing.",
       "invalid_auth": "Invalid portal credentials.",
-      "gateway_not_found": "No IP gateway is visible to this portal account.",
-      "gateway_admin_auth_failed": "Gateway admin password is wrong (login at https://gateway-ip/ as `admin` failed).",
+      "gateway_not_found": "No compatible ABB Welcome IP gateway or SmartTouch panel is visible to this MyBuildings account, or multiple devices require a Portal UUID.",
+      "gateway_admin_auth_failed": "Classic IP gateway web-admin authentication failed. For SmartTouch 10, leave the gateway admin password blank.",
       "no_pending_app": "The gateway did not see our pairing request. Try again or check that the portal account is linked to this gateway.",
       "integrity_code_rejected": "The gateway rejected the integrity code we computed. Open an issue with your gateway firmware version.",
       "gateway_admin_failed": "Talking to the gateway admin CGI failed — see the Home Assistant log.",

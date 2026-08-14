@@ -3,8 +3,8 @@
 [![Open your Home Assistant instance and open a repository inside the Home Assistant Community Store.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=rankjie&repository=ha-abb-welcome&category=integration)
 
 Local controls, ring detection, and live intercom streams for ABB Welcome /
-Busch-Jaeger building intercoms backed by an **IP gateway** (system type
-`mrange`).
+Busch-Jaeger building intercoms backed by a **classic IP gateway** or an
+**ABB/Busch-Jaeger SmartTouch 10** acting as the Welcome IP/SIP bridge.
 
 This integration is LAN-first. Pairing uses the ABB MyBuildings cloud portal
 once, then unlocks, realtime ring detection, and live video/audio run directly
@@ -23,6 +23,26 @@ doorbell notifications, and two-way audio.
 > live video, audio, talkback, and safer pickup handling, install this HA
 > integration first, then add the companion
 > [ABB HA Doorbell Scrypted plugin][scrypted-bridge].
+
+
+## SmartTouch 10 support
+
+This fork adds generic SmartTouch 10 support without embedding any installation-
+specific data. SmartTouch is discovered through the MyBuildings device type
+`com.abb.ispf.client.welcome.panel`; no local web-admin password or fixed UUID is
+required. If a MyBuildings account contains multiple compatible Welcome devices,
+enter the desired device's Portal UUID during setup.
+
+Verified SmartTouch media path:
+
+- local SIP-TLS registration on TCP 5061
+- Welcome outdoor station addresses from the signed ACL update
+- H.264 video over RTP
+- PCMA/G.711 audio over RTP
+- local camera streaming works without a separate ABB 83342 IP gateway
+
+The one-time MyBuildings pairing still uses ABB's portal to issue the client
+certificate and ACL. After pairing, SIP/intercom media runs locally.
 
 ## Features
 
@@ -50,11 +70,12 @@ doorbell notifications, and two-way audio.
 
 ## Requirements
 
-- An ABB Welcome **IP gateway** reachable on your local network, such as ABB
-  **83342** or another `mrange` IP gateway.
+- An ABB Welcome IP endpoint reachable on your LAN: a classic **83342 / mrange**
+  IP gateway **or ABB/Busch-Jaeger SmartTouch 10** linked to Welcome.
 - An **ABB-Welcome / Busch-Jaeger MyBuildings** account already linked to that
   gateway.
-- The gateway **web admin password** used at `https://<gateway-ip>/`.
+- Classic IP gateway only: the gateway **web admin password**. SmartTouch 10
+  does not require a gateway web-admin password.
 - For Apple Home: a working Scrypted installation and the
   [ABB HA Doorbell Scrypted plugin][scrypted-bridge].
 
@@ -84,8 +105,8 @@ Fill in:
 
 - MyBuildings portal **username**
 - MyBuildings portal **password**
-- Gateway local **IP address**
-- Gateway **web admin password**
+- ABB Welcome device local **IP address**
+- Classic IP gateway only: **web admin password** (leave blank for SmartTouch 10)
 
 Optional: if automatic setup cannot read the gateway UUID from the local
 `portalclient.cgi` endpoint, fill in **Gateway Portal UUID** from the gateway web
@@ -95,11 +116,11 @@ The integration then:
 
 1. Generates a fresh RSA keypair and requests a client certificate from the
    MyBuildings portal.
-2. Reads the gateway UUID from the local gateway admin API.
+2. Selects the Welcome device: classic gateways can use the local admin API; SmartTouch panels are discovered through MyBuildings (`welcome.panel`).
 3. Computes the gateway integrity code from the certificate fingerprint.
 4. Sends a `welcome.connect` event so the gateway sees a pending pairing entry.
-5. Logs into the gateway admin API, finds that pending entry, sets permissions,
-   and submits the integrity code.
+5. Classic gateways are approved through the gateway admin API; SmartTouch
+   completes the same Welcome pairing through the panel/MyBuildings flow.
 6. Polls for the gateway ACL update, decrypts the SIP password, reads the door
    list, and creates HA entities.
 
@@ -410,6 +431,8 @@ works with **Fast**, you can leave it there for the lowest-latency setup.
 
 - **ABB 83342 IP Gateway**, firmware `ASM04_GW_V6.25_20250513_MP_TIDM365`,
   system type `mrange`, 3 outdoor stations.
+- **ABB/Busch-Jaeger SmartTouch 10** with Welcome 2-wire: portal type
+  `com.abb.ispf.client.welcome.panel`; local SIP-TLS + H.264/PCMA RTP verified.
 
 Reports for other models and firmware versions are welcome.
 
@@ -418,3 +441,273 @@ Reports for other models and firmware versions are welcome.
 MIT - see [LICENSE](LICENSE).
 
 [scrypted-bridge]: https://github.com/rankjie/abb-ha-doorbell
+
+
+---
+
+## Credits and upstream
+
+This project is a fork / extension of
+[`rankjie/ha-abb-welcome`](https://github.com/rankjie/ha-abb-welcome).
+
+A large part of this integration originates from the upstream project and its
+contributors.
+
+In particular, the upstream project provides the foundation for:
+
+- ABB MyBuildings communication
+- certificate based client provisioning
+- Welcome pairing
+- SIP signalling
+- SIP-TLS support
+- RTP media handling
+- H.264 video
+- PCMA / G.711 audio
+- ring / intercom handling
+- door control
+- Home Assistant entities
+- go2rtc / WebRTC integration
+- RTSP proxy functionality
+- talkback support
+
+The SmartTouch support in this fork extends that existing work rather than
+replacing it.
+
+The intention is to keep the SmartTouch implementation generic and, where
+possible, suitable for contribution back to the upstream project.
+
+Please also consider supporting and contributing to the original project:
+
+https://github.com/rankjie/ha-abb-welcome
+
+
+## ABB / Busch-Jaeger SmartTouch support
+
+This fork adds support for ABB / Busch-Jaeger SmartTouch devices that are
+exposed through ABB MyBuildings as:
+
+```text
+com.abb.ispf.client.welcome.panel
+```
+
+Classic ABB Welcome IP gateways such as the 83342 are exposed differently and
+continue to use the existing upstream integration path.
+
+The SmartTouch implementation avoids depending on the legacy
+`portalclient.cgi` web administration interface, because SmartTouch panels do
+not expose that interface in the same way as classic IP gateways.
+
+Instead, provisioning uses the existing ABB MyBuildings mechanisms:
+
+```text
+MyBuildings authentication
+        |
+        v
+ABB signed client certificate
+        |
+        v
+Welcome device discovery
+        |
+        v
+com.abb.ispf.client.welcome.panel
+        |
+        v
+welcome.connect
+        |
+        v
+SmartTouch client approval
+        |
+        v
+welcome.acl-update
+        |
+        +-- SIP identity
+        +-- SIP credentials
+        +-- SIP domain
+        +-- outdoor stations
+```
+
+After successful provisioning, the local media path is:
+
+```text
+ABB / Busch-Jaeger Welcome outdoor station
+        |
+        | Welcome 2-wire
+        v
+SmartTouch
+        |
+        | SIP-TLS
+        | TCP 5061
+        v
+Home Assistant integration
+        |
+        +-- PCMA / G.711 audio over RTP
+        |
+        +-- H.264 video over RTP
+        |
+        v
+go2rtc / WebRTC / Home Assistant
+```
+
+SmartTouch support was developed and verified using real hardware and local
+protocol testing.
+
+Successful testing included:
+
+- MyBuildings device discovery
+- discovery of a `welcome.panel`
+- certificate provisioning
+- `welcome.connect`
+- `welcome.acl-update`
+- extraction of SIP configuration
+- SIP-TLS registration
+- authenticated SIP REGISTER
+- SIP INVITE to an outdoor station
+- H.264 RTP video
+- PCMA / G.711 RTP audio
+- clean SIP call termination
+
+The implementation is designed to discover installation-specific values
+dynamically.
+
+No installation-specific IP address, Portal UUID, MyBuildings username,
+password, SIP password, private key, client certificate or outdoor-station
+identity should be hard-coded into this repository.
+
+
+## Privacy and credentials
+
+Never publish or commit any of the following:
+
+- MyBuildings username/password combinations
+- SIP passwords
+- client private keys
+- client certificates containing installation-specific identities
+- Home Assistant secrets
+- Home Assistant backups
+- pairing credentials
+- ABB Portal UUIDs belonging to a private installation
+- private network addresses where they identify a real installation
+- packet captures from a private network
+- diagnostic exports containing credentials
+- QR codes used for device pairing
+
+If you are reporting a bug, remove or redact private information before
+uploading logs or diagnostics.
+
+In particular, do not upload files such as:
+
+```text
+*_private_key.pem
+*_certificate.pem
+*_credentials.json
+*.pcap
+*.pcapng
+secrets.yaml
+```
+
+unless you have carefully verified and sanitized their contents.
+
+
+## Security warning
+
+This integration communicates with building intercom and access-control
+equipment.
+
+Depending on the device and configuration, functionality may include:
+
+- live camera access
+- microphone/audio communication
+- incoming door calls
+- intercom communication
+- door unlocking
+- building access related functions
+
+Incorrect configuration, bugs or unexpected device behaviour could therefore
+have security consequences.
+
+Do not rely on this integration as the sole mechanism for:
+
+- physical access security
+- emergency communication
+- life-safety systems
+- alarm systems
+- fire safety systems
+- critical building security
+
+Test door-opening automations carefully.
+
+It is strongly recommended that door unlocking requires an explicit user
+action rather than being performed automatically from untrusted triggers.
+
+
+## Disclaimer
+
+This is an independent community project.
+
+It is not affiliated with, endorsed by, sponsored by or officially supported
+by:
+
+- ABB
+- Busch-Jaeger
+- Home Assistant
+- HACS
+
+ABB, Busch-Jaeger, Welcome, free@home, Home Assistant, HACS and other product
+or company names may be trademarks of their respective owners.
+
+This project uses undocumented and/or partially documented interfaces.
+Firmware updates, ABB MyBuildings changes, network protocol changes or device
+updates may change behaviour or break functionality at any time.
+
+Use this software entirely at your own risk.
+
+The maintainers and contributors cannot guarantee:
+
+- continuous operation
+- compatibility with future firmware
+- compatibility with every Welcome installation
+- availability of ABB cloud services
+- correct operation of access-control functionality
+- protection against data loss
+- protection against incorrect device operation
+- protection against unintended door operation
+
+Always keep an independent method of accessing and operating your building
+intercom system.
+
+
+## License
+
+This fork retains the license and copyright notices of the upstream project.
+
+The existing `LICENSE` file must remain included when distributing copies or
+substantial portions of this software.
+
+SmartTouch-specific modifications in this fork are distributed under the same
+license unless explicitly stated otherwise.
+
+See [`LICENSE`](LICENSE) for the complete license text, warranty disclaimer and
+limitation of liability.
+
+
+## Contributions
+
+Contributions are welcome.
+
+When submitting SmartTouch-related changes, please avoid installation-specific
+values and make device detection generic wherever possible.
+
+Useful contributions include:
+
+- additional SmartTouch models
+- additional firmware versions
+- improved device discovery
+- improved pairing flows
+- SIP interoperability improvements
+- media compatibility improvements
+- documentation
+- translations
+- automated tests
+
+If functionality can also benefit the upstream project, contributors are
+encouraged to propose the relevant changes upstream as well.

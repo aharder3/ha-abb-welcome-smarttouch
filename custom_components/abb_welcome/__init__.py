@@ -699,10 +699,18 @@ async def _async_refresh_doors_for_entry(
     gateway_ip = entry.data.get("gateway_ip")
     admin_password = entry.data.get("gateway_admin_password")
     sip_domain = entry.data.get("sip_domain")
-    if not (gateway_ip and admin_password and sip_domain):
+    if not admin_password:
+        # SmartTouch panels have no classic gateway web admin. Their outdoor
+        # stations come from the signed ACL update received during pairing.
+        _LOGGER.info(
+            "[abb] refresh_doors: entry %s has no gateway admin password; "
+            "keeping ACL-provided door list (expected for SmartTouch)",
+            entry.entry_id,
+        )
+        return False
+    if not (gateway_ip and sip_domain):
         _LOGGER.warning(
-            "[abb] refresh_doors: entry %s missing gateway_ip, "
-            "gateway_admin_password, or sip_domain; skipping",
+            "[abb] refresh_doors: entry %s missing gateway_ip or sip_domain; skipping",
             entry.entry_id,
         )
         return False

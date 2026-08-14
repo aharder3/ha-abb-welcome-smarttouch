@@ -5,3 +5,14 @@ __pycache__/
 .idea/
 .vscode/
 scrypted/
+
+# Local SmartTouch development / secrets
+credentials/
+private-tests/
+st10_*.py
+.venv/
+*.pcap
+*.pcapng
+*_private_key.pem
+*_certificate.pem
+*_credentials.json
