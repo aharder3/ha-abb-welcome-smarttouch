@@ -128,108 +128,25 @@ A successful pairing typically completes in under 15 seconds.
 
 ## Apple Home / HomeKit
 
-> [!IMPORTANT]
-> **Full Apple Home doorbell = HA integration + Scrypted plugin.**
->
-> Do **not** rely on HA's native HomeKit bridge if you want a real Apple Home
-> doorbell. HA can expose a one-way camera and ring sensor, but the usable
-> HomeKit microphone path, Apple Home doorbell accessory, and pickup-safety
-> controls are provided by the companion
-> [ABB HA Doorbell Scrypted plugin][scrypted-bridge].
+For full Apple Home / HomeKit doorbell support, use the companion
+[ABB HA Doorbell Scrypted plugin](https://github.com/rankjie/abb-ha-doorbell).
 
-| Goal | Use |
-|---|---|
-| Door buttons, HA cameras, ring events, SIP/RTP media, talkback services | This Home Assistant integration |
-| Import ABB stations into Apple Home as full HomeKit doorbells | [ABB HA Doorbell Scrypted plugin][scrypted-bridge] |
-| HomeKit microphone / two-way audio | Scrypted plugin, backed by HA talkback services |
-| Apple TV/Home Hub preview blocking | Scrypted plugin **HomeKit Pickup Safety** |
-| Basic one-way HomeKit camera only | HA native HomeKit bridge, if you do not need talkback |
+This Home Assistant integration provides the ABB Welcome connection, door
+stations, ring events, camera streams, SIP/RTP media, door control and talkback
+services.
 
-```mermaid
-flowchart LR
-    Door[ABB Welcome door station] -->|SIP INVITE ring| HA[Home Assistant integration]
-    HA -->|ring event + camera entities + talkback services| Scrypted[Scrypted plugin]
-    Scrypted -->|Doorbell accessory| HomeKit[Apple Home]
-    HomeKit -->|live view + microphone| Scrypted
-    Scrypted -->|PCM talkback services| HA
-    HA -->|PCMA/G.711 RTP| Door
+The companion Scrypted plugin uses these Home Assistant features to expose the
+ABB Welcome door stations to Apple Home as HomeKit doorbells with live video,
+doorbell notifications and two-way audio.
 
-    TV[Apple TV / Home Hub preview] -. optional local preview .-> Scrypted
-    Scrypted -. HomeKit Pickup Safety can block local preview .-> TV
-```
+Home Assistant's native HomeKit bridge can be used for basic camera exposure,
+but the companion Scrypted plugin is required for the full doorbell and
+two-way-audio experience.
 
-Recommended setup:
+For Scrypted installation, Apple Home setup, HomeKit configuration and
+troubleshooting, see:
 
-1. Install and configure this HA integration.
-2. Confirm the HA camera stream works by turning on
-   `switch.<gateway>_streaming_enabled` and opening a camera.
-3. Install the [Scrypted plugin][scrypted-bridge].
-4. In the Scrypted plugin settings, enter:
-   - **Home Assistant URL**
-   - **Home Assistant Token** (a long-lived access token)
-5. Leave **Primary Door Station** blank unless you want a specific station to
-   keep the existing `front-door` HomeKit identity.
-6. Add the Scrypted doorbells to Scrypted's HomeKit plugin.
-7. Keep Scrypted HomeKit **Transcode Video** and **Transcode Audio** enabled.
-   The plugin enables them automatically, but they should stay on for reliable
-   Home app video and audio.
-
-The Scrypted plugin discovers HA camera entities, station ids, ring state,
-snapshot image data, the streaming switch, and each camera's `lan_rtsp_url`.
-When HA reloads or moves the LAN RTSP proxy to another port, it fires
-`abb_welcome_discovery_changed`; Scrypted listens for that event and refreshes
-without subscribing to every HA entity.
-
-### Doorbell Ring Flow
-
-The intended Apple Home flow is:
-
-1. Someone presses a door station.
-2. HA receives the local SIP `INVITE`.
-3. HA fires `abb_welcome_ring` and updates the ring binary sensor.
-4. Scrypted turns that into a HomeKit doorbell notification.
-5. If the user opens the Home notification or live view, Scrypted asks HA for the
-   matching stream.
-6. HA accepts the pending incoming call for that station, or proactively dials
-   the station for manual live view.
-7. HomeKit receives video/audio, and HomeKit microphone audio is sent back
-   through HA talkback services.
-
-Receiving the ring does **not** answer the intercom by itself. HA only arms the
-stream. The call is accepted when a real stream consumer opens the camera.
-
-### Allow Pickup
-
-`switch.<gateway>_allow_pickup` controls whether HA/Scrypted/HomeKit may answer
-an incoming ringing call.
-
-- **On**: an incoming ring arms streaming for that station. Opening the matching
-  camera from HomeKit can pick up the ringing call.
-- **Off**: an incoming ring force-disarms streaming. HA still reports the ring,
-  but it refuses HomeKit/Scrypted pickup so phones and indoor stations can
-  answer safely.
-
-This is independent from manual proactive streaming. You can still turn on
-`Streaming enabled` and open a camera outside a ring.
-
-### Apple TV / Home Hub Preview
-
-Apple TV and some Home Hubs may open a local preview immediately after a
-doorbell ring. ABB Welcome intercom media is exclusive, so an automatic preview
-can occupy the call before a person answers.
-
-If Apple Home uses an Apple TV or Home Hub:
-
-- Configure **HomeKit Pickup Safety** in the Scrypted plugin.
-- Assign the Apple TV/Home Hub a fixed LAN IP if possible.
-- Enter that IP in Scrypted's **Apple TV / Home Hub IPs** setting if you want
-  automatic local previews blocked.
-- Leave the IP field blank if you do not want preview blocking.
-- Do not enable Scrypted Rebroadcast or Prebuffer for ABB doorbells.
-
-The Scrypted block only rejects matching **local** HomeKit preview requests
-during the ring window. Manual Home app viewing and remote viewing through the
-same Home Hub remain allowed.
+**[ABB HA Doorbell for Scrypted →](https://github.com/rankjie/abb-ha-doorbell)**
 
 ## Entities
 
@@ -418,14 +335,9 @@ works with **Fast**, you can leave it there for the lowest-latency setup.
   open the camera within the armed window.
 - **Camera has video but no audio**: confirm you are on a current version and
   that the stream includes the PCMA/G.711 audio track.
-- **HomeKit has video but no microphone**: add the doorbells through the
-  [Scrypted plugin][scrypted-bridge], not only through HA's native HomeKit
-  bridge.
-- **Apple TV opens a preview by itself**: configure Scrypted **HomeKit Pickup
-  Safety**, enter the Apple TV/Home Hub fixed LAN IP, and keep
-  Rebroadcast/Prebuffer disabled for ABB doorbells.
-- **Scrypted cannot load stream after HA reload**: click **Refresh Discovery** in
-  the Scrypted plugin, or check the camera `lan_rtsp_url` attribute.
+- **Apple Home / Scrypted issues**: see the
+  [ABB HA Doorbell Scrypted plugin documentation](https://github.com/rankjie/abb-ha-doorbell)
+  for HomeKit setup and troubleshooting.
 
 ## Tested Hardware
 
