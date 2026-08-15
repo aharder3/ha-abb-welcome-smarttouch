@@ -3,14 +3,7 @@
     "step": {
       "user": {
         "title": "ABB Welcome",
-        "description": "Pair Home Assistant with an ABB Welcome IP gateway or SmartTouch panel.\n\nRequired:\n• MyBuildings portal username and password (use the portal username, not necessarily the email address).\n• Local IP address of the ABB Welcome IP device.\n\nClassic IP gateway (for example 83342): also enter the gateway web-admin password.\nSmartTouch 10: leave the gateway web-admin password blank; SmartTouch exposes SIP-TLS locally and is selected from MyBuildings discovery.\n\nOptional: Portal UUID. Use it when more than one compatible Welcome device is linked to the same MyBuildings account.",
-        "data": {
-          "abb_username": "Portal Username",
-          "abb_password": "Portal Password",
-          "gateway_ip": "ABB Welcome device IP address",
-          "gateway_password": "Gateway admin password (classic IP gateway only)",
-          "gateway_uuid_override": "Portal UUID (optional; selects one device)"
-        }
+        "description": "Searching the local network for ABB Welcome devices…"
       },
       "manual_authorize": {
         "title": "Complete ABB Welcome pairing",
@@ -19,6 +12,36 @@
       "confirm": {
         "title": "Confirm Setup",
         "description": "Pairing complete.\n\nSIP user: `{sip_username}@{sip_domain}`\nDoors discovered ({door_count}):\n\n{door_names}"
+      },
+      "select_device": {
+        "title": "Select ABB Welcome device",
+        "description": "Found {device_count} local candidate(s). Select your SmartTouch 10 / ABB Welcome IP gateway, or choose manual IP entry.",
+        "data": {
+          "device": "Discovered device"
+        }
+      },
+      "manual": {
+        "title": "Enter IP address manually",
+        "description": "Enter the local IPv4 address of the SmartTouch 10 or ABB Welcome IP gateway.",
+        "data": {
+          "gateway_ip": "Device IPv4 address"
+        },
+        "data_description": {
+          "gateway_ip": "Format example: 192.168.1.100"
+        }
+      },
+      "login": {
+        "title": "ABB Welcome login",
+        "description": "Selected device: **{device_type}** at **{gateway_ip}**.\n\nEnter the MyBuildings portal credentials. The local gateway admin password is requested only for a classic ABB Welcome IP gateway; SmartTouch 10 does not expose the classic gateway web-admin interface.",
+        "data": {
+          "abb_username": "Portal username",
+          "abb_password": "Portal password",
+          "gateway_password": "Gateway admin password",
+          "gateway_uuid_override": "Portal UUID (optional; selects one device)"
+        },
+        "data_description": {
+          "gateway_uuid_override": "Only needed if multiple compatible Welcome devices are linked to the same MyBuildings account."
+        }
       }
     },
     "error": {
@@ -31,7 +54,8 @@
       "gateway_admin_failed": "Talking to the gateway admin CGI failed — see the Home Assistant log.",
       "gateway_op6_failed": "Could not read the gateway's portal UUID. Some firmware versions have a broken portal-client endpoint. Fill in the optional 'Gateway Portal UUID' field and try again.",
       "invalid_uuid": "Gateway Portal UUID must look like 8d24f178-9c41-4aed-97e1-6008bb6aef82 (8-4-4-4-12 hex). Leave blank to auto-detect.",
-      "unknown": "Unexpected error — see the Home Assistant log."
+      "unknown": "Unexpected error — see the Home Assistant log.",
+      "invalid_ip": "Enter a valid IPv4 address, for example 192.168.1.100."
     },
     "abort": {
       "already_configured": "This gateway is already configured.",

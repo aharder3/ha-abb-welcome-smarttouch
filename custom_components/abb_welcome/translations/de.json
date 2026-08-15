@@ -1,0 +1,90 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "ABB Welcome",
+        "description": "Das lokale Netzwerk wird nach ABB-Welcome-Geräten durchsucht…"
+      },
+      "select_device": {
+        "title": "ABB-Welcome-Gerät auswählen",
+        "description": "{device_count} mögliche lokale Geräte gefunden. Wähle dein SmartTouch 10 / ABB Welcome IP Gateway oder die manuelle IP-Eingabe.",
+        "data": {
+          "device": "Gefundenes Gerät"
+        }
+      },
+      "manual": {
+        "title": "IP-Adresse manuell eingeben",
+        "description": "Gib die lokale IPv4-Adresse des SmartTouch 10 oder ABB Welcome IP Gateways ein.",
+        "data": {
+          "gateway_ip": "IPv4-Adresse des Geräts"
+        },
+        "data_description": {
+          "gateway_ip": "Formatbeispiel: 192.168.1.100"
+        }
+      },
+      "login": {
+        "title": "ABB Welcome Anmeldung",
+        "description": "Ausgewähltes Gerät: **{device_type}** unter **{gateway_ip}**.\n\nGib die Zugangsdaten des MyBuildings-Portals ein. Das lokale Gateway-Admin-Passwort wird nur bei einem klassischen ABB Welcome IP Gateway benötigt. Beim SmartTouch 10 wird dieses Feld nicht angezeigt.",
+        "data": {
+          "abb_username": "Portal-Benutzername",
+          "abb_password": "Portal-Passwort",
+          "gateway_password": "Gateway-Admin-Passwort",
+          "gateway_uuid_override": "Portal-UUID (optional)"
+        },
+        "data_description": {
+          "gateway_uuid_override": "Nur nötig, wenn mehrere kompatible Welcome-Geräte mit demselben MyBuildings-Konto verbunden sind."
+        }
+      },
+      "manual_authorize": {
+        "title": "ABB Welcome Kopplung abschließen",
+        "description": "Die Kopplungsanfrage wurde erfolgreich gesendet.\n\n**SmartTouch 10:** Öffne **Systemeinstellungen → Netzwerkverbindungen → Welcome APP** und genehmige den neuen Client `{client_name}`, falls das Panel danach fragt.\n\n**Klassisches IP Gateway:** Öffne `https://{gateway_ip}/`, gehe zu Portal / App-Verwaltung, wähle `{client_name}` und gib den Integritätscode **{integrity_code}** ein.\n\nDanach auf **Absenden** klicken.\n\nDiagnose: {error_detail}"
+      },
+      "confirm": {
+        "title": "Einrichtung bestätigen",
+        "description": "Kopplung abgeschlossen.\n\nSIP-Benutzer: `{sip_username}@{sip_domain}`\nGefundene Türen ({door_count}):\n\n{door_names}"
+      }
+    },
+    "error": {
+      "cannot_connect": "Das ABB-Welcome-Gerät ist weder über HTTPS 443 noch SIP-TLS 5061 erreichbar.",
+      "invalid_ip": "Gib eine gültige IPv4-Adresse ein, zum Beispiel 192.168.1.100.",
+      "invalid_auth": "Ungültige Portal-Zugangsdaten.",
+      "gateway_not_found": "Kein kompatibles ABB Welcome IP Gateway oder SmartTouch Panel wurde im MyBuildings-Konto gefunden.",
+      "gateway_admin_auth_failed": "Die Anmeldung am lokalen Gateway ist fehlgeschlagen.",
+      "no_pending_app": "Das Gateway hat die Kopplungsanfrage nicht gefunden.",
+      "integrity_code_rejected": "Das Gateway hat den Integritätscode abgelehnt.",
+      "gateway_admin_failed": "Die Kommunikation mit der Gateway-Verwaltung ist fehlgeschlagen.",
+      "gateway_op6_failed": "Die Portal-UUID des Gateways konnte nicht gelesen werden.",
+      "invalid_uuid": "Die Portal-UUID muss das Format 8-4-4-4-12 Hex-Zeichen haben.",
+      "unknown": "Unerwarteter Fehler – siehe Home-Assistant-Protokoll."
+    },
+    "abort": {
+      "already_configured": "Dieses Gateway ist bereits eingerichtet.",
+      "acl_timeout": "Nach der Kopplung wurde keine Konfiguration empfangen.",
+      "acl_parse_failed": "Die empfangene Konfiguration konnte nicht verarbeitet werden.",
+      "unknown": "Unerwarteter Fehler beim Abrufen der ACL."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "ABB Welcome Optionen",
+        "description": "Türöffner-Verhalten und LAN-RTSP-Endpunkt.",
+        "data": {
+          "unlock_strategy": "Türöffner-Strategie",
+          "lan_rtsp_host": "Home-Assistant LAN-Host (leer = automatisch)",
+          "lan_rtsp_port": "LAN-RTSP-Port",
+          "allow_pickup": "Annehmen von Streams erlauben"
+        }
+      }
+    }
+  },
+  "selector": {
+    "unlock_strategy": {
+      "options": {
+        "hybrid": "Hybrid – empfohlen",
+        "fast": "Schnell – geringste Verzögerung",
+        "standard": "Standard – höchste Kompatibilität"
+      }
+    }
+  }
+}

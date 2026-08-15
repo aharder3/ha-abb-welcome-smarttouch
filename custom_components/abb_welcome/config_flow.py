@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
+from contextlib import suppress
+from ipaddress import IPv4Address, ip_address, ip_network
 import logging
 import re
 import socket
 
 import voluptuous as vol
 
+from homeassistant.components import network
 from homeassistant.config_entries import (
     ConfigEntry,
     ConfigFlow,
@@ -74,20 +78,10 @@ _UUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
 )
 
-STEP_USER_DATA_SCHEMA = vol.Schema(
-    {
-        vol.Required(CONF_ABB_USERNAME): str,
-        vol.Required(CONF_ABB_PASSWORD): selector.TextSelector(
-            selector.TextSelectorConfig(type=selector.TextSelectorType.PASSWORD)
-        ),
-        vol.Required(CONF_GATEWAY_IP): str,
-        vol.Optional(CONF_GATEWAY_PASSWORD, default=""): selector.TextSelector(
-            selector.TextSelectorConfig(type=selector.TextSelectorType.PASSWORD)
-        ),
-        vol.Optional(CONF_GATEWAY_UUID_OVERRIDE, default=""): str,
-    }
-)
-
+DISCOVERY_MANUAL = "__manual__"
+DISCOVERY_TIMEOUT = 0.35
+DISCOVERY_CONCURRENCY = 48
+DISCOVERY_MAX_HOSTS_PER_ADAPTER = 254
 
 GATEWAY_WEB_PORT = 443
 
@@ -113,6 +107,129 @@ def _welcome_device_reachable(host: str, timeout: float = 5) -> bool:
     return _gateway_web_reachable(host, timeout) or _port_reachable(
         host, SIP_PORT_TLS, timeout
     )
+
+
+async def _async_port_reachable(
+    host: str, port: int, timeout: float = DISCOVERY_TIMEOUT
+) -> bool:
+    """Check one TCP port without blocking Home Assistant's event loop."""
+    try:
+        _reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port),
+            timeout=timeout,
+        )
+    except (TimeoutError, OSError):
+        return False
+
+    writer.close()
+    with suppress(Exception):
+        await writer.wait_closed()
+
+    return True
+
+
+async def _async_probe_welcome_host(
+    host: str,
+    semaphore: asyncio.Semaphore,
+) -> dict[str, str] | None:
+    """Return an ABB Welcome candidate when a known local port answers."""
+    async with semaphore:
+        https_open, sip_tls_open = await asyncio.gather(
+            _async_port_reachable(host, GATEWAY_WEB_PORT),
+            _async_port_reachable(host, SIP_PORT_TLS),
+        )
+
+    if not https_open and not sip_tls_open:
+        return None
+
+    if sip_tls_open and not https_open:
+        device_type = "smarttouch"
+        label = f"SmartTouch 10 candidate — {host}"
+    elif https_open:
+        device_type = "gateway"
+        label = f"ABB Welcome IP gateway candidate — {host}"
+    else:
+        device_type = "unknown"
+        label = f"ABB Welcome candidate — {host}"
+
+    return {
+        "host": host,
+        "device_type": device_type,
+        "label": label,
+    }
+
+
+async def _async_discover_local_devices(hass) -> list[dict[str, str]]:
+    """Scan local IPv4 networks for ABB Welcome candidates.
+
+    Large networks are restricted to the /24 containing Home Assistant.
+    Manual IP entry is always available as fallback.
+    """
+    adapters = await network.async_get_adapters(hass)
+    hosts: set[str] = set()
+
+    for adapter in adapters:
+        if adapter.get("enabled") is False:
+            continue
+
+        for ip_info in adapter.get("ipv4", []):
+            local_raw = ip_info.get("address")
+            prefix_raw = ip_info.get("network_prefix")
+
+            if not local_raw or prefix_raw is None:
+                continue
+
+            try:
+                local_ip = ip_address(local_raw)
+
+                if not isinstance(local_ip, IPv4Address):
+                    continue
+
+                if local_ip.is_loopback or local_ip.is_link_local:
+                    continue
+
+                prefix = int(prefix_raw)
+
+                # Never scan more than one /24 per adapter.
+                scan_prefix = max(prefix, 24)
+
+                subnet = ip_network(
+                    f"{local_ip}/{scan_prefix}",
+                    strict=False,
+                )
+
+            except (ValueError, TypeError):
+                continue
+
+            candidates = list(subnet.hosts())
+
+            if len(candidates) > DISCOVERY_MAX_HOSTS_PER_ADAPTER:
+                candidates = candidates[:DISCOVERY_MAX_HOSTS_PER_ADAPTER]
+
+            for candidate in candidates:
+                if candidate != local_ip:
+                    hosts.add(str(candidate))
+
+    if not hosts:
+        return []
+
+    semaphore = asyncio.Semaphore(DISCOVERY_CONCURRENCY)
+
+    results = await asyncio.gather(
+        *(
+            _async_probe_welcome_host(host, semaphore)
+            for host in sorted(
+                hosts,
+                key=lambda value: int(ip_address(value)),
+            )
+        )
+    )
+
+    return [
+        result
+        for result in results
+        if result is not None
+    ]
 
 
 class ABBWelcomeConfigFlow(ConfigFlow, domain=DOMAIN):
@@ -149,6 +266,8 @@ class ABBWelcomeConfigFlow(ConfigFlow, domain=DOMAIN):
         self._doors: list[dict] = []
         self._manual_authorize = False
         self._authorize_error_msg = ""
+        self._device_type = ""
+        self._discovered_devices: list[dict[str, str]] = []
 
     async def _check_unique(self, gateway_uuid: str) -> ConfigFlowResult | None:
         await self.async_set_unique_id(gateway_uuid)
@@ -161,97 +280,331 @@ class ABBWelcomeConfigFlow(ConfigFlow, domain=DOMAIN):
     async def async_step_user(
         self, user_input: dict | None = None
     ) -> ConfigFlowResult:
-        """Single-step setup: collect credentials and run pairing end-to-end."""
+        """Start setup by scanning the local network."""
+        return await self.async_step_scan()
+
+    async def async_step_scan(
+        self, user_input: dict | None = None
+    ) -> ConfigFlowResult:
+        """Discover SmartTouch 10 panels and ABB Welcome IP gateways."""
+        self._discovered_devices = await _async_discover_local_devices(
+            self.hass
+        )
+
+        if self._discovered_devices:
+            return await self.async_step_select_device()
+
+        return await self.async_step_manual()
+
+    async def async_step_select_device(
+        self, user_input: dict | None = None
+    ) -> ConfigFlowResult:
+        """Select one discovered ABB Welcome device."""
+        if user_input is not None:
+            selected = str(user_input["device"])
+
+            if selected == DISCOVERY_MANUAL:
+                return await self.async_step_manual()
+
+            match = next(
+                (
+                    device
+                    for device in self._discovered_devices
+                    if device["host"] == selected
+                ),
+                None,
+            )
+
+            if match is None:
+                return await self.async_step_scan()
+
+            self._gateway_ip = match["host"]
+            self._device_type = match["device_type"]
+
+            return await self.async_step_login()
+
+        options = [
+            {
+                "value": device["host"],
+                "label": device["label"],
+            }
+            for device in self._discovered_devices
+        ]
+
+        options.append(
+            {
+                "value": DISCOVERY_MANUAL,
+                "label": "Enter IP address manually",
+            }
+        )
+
+        return self.async_show_form(
+            step_id="select_device",
+            data_schema=vol.Schema(
+                {
+                    vol.Required("device"): selector.SelectSelector(
+                        selector.SelectSelectorConfig(
+                            options=options,
+                            mode=selector.SelectSelectorMode.DROPDOWN,
+                        )
+                    )
+                }
+            ),
+            description_placeholders={
+                "device_count": str(len(self._discovered_devices)),
+            },
+        )
+
+    async def async_step_manual(
+        self, user_input: dict | None = None
+    ) -> ConfigFlowResult:
+        """Accept a manually entered IPv4 address."""
         errors: dict[str, str] = {}
 
         if user_input is not None:
-            self._username = user_input[CONF_ABB_USERNAME].strip()
+            host = str(
+                user_input[CONF_GATEWAY_IP]
+            ).strip()
+
+            try:
+                parsed = ip_address(host)
+
+                if not isinstance(parsed, IPv4Address):
+                    raise ValueError
+
+            except ValueError:
+                errors[CONF_GATEWAY_IP] = "invalid_ip"
+
+            else:
+                reachable = await self.hass.async_add_executor_job(
+                    _welcome_device_reachable,
+                    host,
+                )
+
+                if not reachable:
+                    errors["base"] = "cannot_connect"
+
+                else:
+                    self._gateway_ip = str(parsed)
+
+                    web_reachable = (
+                        await self.hass.async_add_executor_job(
+                            _gateway_web_reachable,
+                            self._gateway_ip,
+                        )
+                    )
+
+                    self._device_type = (
+                        "gateway"
+                        if web_reachable
+                        else "smarttouch"
+                    )
+
+                    return await self.async_step_login()
+
+        return self.async_show_form(
+            step_id="manual",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(
+                        CONF_GATEWAY_IP,
+                        description={
+                            "suggested_value": "192.168.1.100"
+                        },
+                    ): selector.TextSelector()
+                }
+            ),
+            errors=errors,
+        )
+
+    async def async_step_login(
+        self, user_input: dict | None = None
+    ) -> ConfigFlowResult:
+        """Collect credentials after local device selection."""
+        errors: dict[str, str] = {}
+
+        if user_input is not None:
+            self._username = str(
+                user_input[CONF_ABB_USERNAME]
+            ).strip()
+
             self._password = user_input[CONF_ABB_PASSWORD]
-            self._gateway_ip = user_input[CONF_GATEWAY_IP].strip()
-            self._gateway_password = user_input.get(CONF_GATEWAY_PASSWORD, "")
-            uuid_raw = user_input.get(CONF_GATEWAY_UUID_OVERRIDE, "").strip().lower()
+
+            self._gateway_password = str(
+                user_input.get(CONF_GATEWAY_PASSWORD, "")
+            )
+
+            uuid_raw = str(
+                user_input.get(
+                    CONF_GATEWAY_UUID_OVERRIDE,
+                    "",
+                )
+            ).strip().lower()
+
             if uuid_raw and not _UUID_RE.fullmatch(uuid_raw):
                 errors[CONF_GATEWAY_UUID_OVERRIDE] = "invalid_uuid"
+
             self._gateway_uuid_override = uuid_raw
 
             if not errors:
                 reachable = await self.hass.async_add_executor_job(
-                    _welcome_device_reachable, self._gateway_ip
+                    _welcome_device_reachable,
+                    self._gateway_ip,
                 )
+
                 if not reachable:
                     errors["base"] = "cannot_connect"
 
             if not errors:
-                # Phase 1: portal-side setup + send connect event to gateway.
-                # Errors here are unrecoverable (we never put a pending request
-                # on the gateway), so they go straight back to the form.
                 try:
-                    await self.hass.async_add_executor_job(self._do_pairing_setup)
+                    await self.hass.async_add_executor_job(
+                        self._do_pairing_setup
+                    )
+
                 except GatewayAdminError as err:
                     msg = str(err).lower()
+
                     if "login failed" in msg:
                         errors["base"] = "gateway_admin_auth_failed"
+
                     elif "missing uuid" in msg or "op=6" in msg:
-                        # Local op=6 lookup failed and user didn't supply an
-                        # override. Tell them how to recover.
                         errors["base"] = "gateway_op6_failed"
+
                     else:
-                        _log_error("Gateway admin error during setup: %s", err)
+                        _log_error(
+                            "Gateway admin error during setup: %s",
+                            err,
+                        )
                         errors["base"] = "gateway_admin_failed"
+
                 except PortalError as err:
                     msg = str(err).lower()
+
                     if "401" in msg or "auth" in msg:
                         errors["base"] = "invalid_auth"
-                    elif "no discovery" in msg or "gateway entry" in msg:
+
+                    elif (
+                        "no discovery" in msg
+                        or "gateway entry" in msg
+                    ):
                         errors["base"] = "gateway_not_found"
+
                     else:
-                        _log_error("Portal pairing error: %s", err)
-                        errors["base"] = "unknown"
-                except Exception as err:  # noqa: BLE001
-                    _LOGGER.exception("Unexpected portal setup error: %s", err)
-                    errors["base"] = "unknown"
-                else:
-                    # SmartTouch panels do not expose the classic portalclient.cgi
-                    # web admin. The welcome.connect event is sufficient to put
-                    # the client into the panel pairing flow; some firmware
-                    # revisions auto-approve it, others may ask on the panel.
-                    if self._welcome_client_type == SMARTTOUCH_CLIENT_TYPE:
-                        self._manual_authorize = True
-                        self._authorize_error_msg = (
-                            "SmartTouch pairing uses the panel/MyBuildings flow; "
-                            "no classic gateway web admin is available."
+                        _log_error(
+                            "Portal pairing error: %s",
+                            err,
                         )
+                        errors["base"] = "unknown"
+
+                except Exception as err:  # noqa: BLE001
+                    _LOGGER.exception(
+                        "Unexpected portal setup error: %s",
+                        err,
+                    )
+                    errors["base"] = "unknown"
+
+                else:
+                    if (
+                        self._welcome_client_type
+                        == SMARTTOUCH_CLIENT_TYPE
+                    ):
+                        self._manual_authorize = True
+
+                        self._authorize_error_msg = (
+                            "SmartTouch pairing uses the "
+                            "panel/MyBuildings flow; no classic "
+                            "gateway web admin is available."
+                        )
+
                         return await self.async_step_manual_authorize()
 
-                    # Classic IP gateway: auto-approve via local web admin CGI.
                     try:
                         await self.hass.async_add_executor_job(
                             self._do_gateway_authorize
                         )
+
                     except GatewayAdminError as err:
                         msg = str(err).lower()
+
                         if "login failed" in msg:
-                            errors["base"] = "gateway_admin_auth_failed"
+                            errors["base"] = (
+                                "gateway_admin_auth_failed"
+                            )
+
                         else:
                             _log_info(
-                                "Auto-approve failed (%s); offering manual approval",
+                                "Auto-approve failed (%s); "
+                                "offering manual approval",
                                 err,
                             )
+
                             self._manual_authorize = True
                             self._authorize_error_msg = str(err)
-                            return await self.async_step_manual_authorize()
+
+                            return await (
+                                self.async_step_manual_authorize()
+                            )
+
                     except Exception as err:  # noqa: BLE001
                         _LOGGER.exception(
-                            "Unexpected error during auto-approve: %s", err
+                            "Unexpected error during "
+                            "auto-approve: %s",
+                            err,
                         )
                         errors["base"] = "unknown"
+
                     else:
                         return await self.async_step_poll_acl()
 
+        schema: dict = {
+            vol.Required(
+                CONF_ABB_USERNAME
+            ): selector.TextSelector(),
+
+            vol.Required(
+                CONF_ABB_PASSWORD
+            ): selector.TextSelector(
+                selector.TextSelectorConfig(
+                    type=selector.TextSelectorType.PASSWORD
+                )
+            ),
+        }
+
+        # Classic IP Gateway:
+        # show local admin password.
+        #
+        # SmartTouch 10:
+        # no classic gateway web-admin -> hide this field.
+        if self._device_type == "gateway":
+            schema[
+                vol.Required(CONF_GATEWAY_PASSWORD)
+            ] = selector.TextSelector(
+                selector.TextSelectorConfig(
+                    type=selector.TextSelectorType.PASSWORD
+                )
+            )
+
+        schema[
+            vol.Optional(
+                CONF_GATEWAY_UUID_OVERRIDE,
+                default="",
+            )
+        ] = selector.TextSelector()
+
+        device_label = (
+            "SmartTouch 10"
+            if self._device_type == "smarttouch"
+            else "ABB Welcome IP gateway"
+        )
+
         return self.async_show_form(
-            step_id="user",
-            data_schema=STEP_USER_DATA_SCHEMA,
+            step_id="login",
+            data_schema=vol.Schema(schema),
             errors=errors,
+            description_placeholders={
+                "gateway_ip": self._gateway_ip,
+                "device_type": device_label,
+            },
         )
 
     def _do_pairing_setup(self) -> None:
