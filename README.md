@@ -10,20 +10,11 @@ This integration is LAN-first. Pairing uses the ABB MyBuildings cloud portal
 once, then unlocks, realtime ring detection, and live video/audio run directly
 against the gateway on your local network.
 
-For Apple Home / HomeKit, use the companion
-[ABB HA Doorbell Scrypted plugin][scrypted-bridge]. The Scrypted plugin imports
-ABB Welcome stations into Apple Home as full HomeKit doorbells with live video,
-doorbell notifications, and two-way audio.
+For Apple Home / HomeKit doorbell support, use the companion
+[ABB HA Doorbell Scrypted plugin](https://github.com/rankjie/abb-ha-doorbell).
 
-> [!IMPORTANT]
-> **Want ABB Welcome in Apple Home? Use Scrypted.**
->
-> HA's native HomeKit bridge can expose a basic camera/ring sensor, but it does
-> not provide the full HomeKit doorbell experience. For Apple Home notifications,
-> live video, audio, talkback, and safer pickup handling, install this HA
-> integration first, then add the companion
-> [ABB HA Doorbell Scrypted plugin][scrypted-bridge].
-
+For installation and HomeKit configuration, see the documentation in the
+Scrypted plugin repository.
 
 ## SmartTouch 10 support
 
@@ -135,18 +126,11 @@ This Home Assistant integration provides the ABB Welcome connection, door
 stations, ring events, camera streams, SIP/RTP media, door control and talkback
 services.
 
-The companion Scrypted plugin uses these Home Assistant features to expose the
-ABB Welcome door stations to Apple Home as HomeKit doorbells with live video,
-doorbell notifications and two-way audio.
+Apple Home / HomeKit configuration is handled by the companion Scrypted plugin.
 
-Home Assistant's native HomeKit bridge can be used for basic camera exposure,
-but the companion Scrypted plugin is required for the full doorbell and
-two-way-audio experience.
+For installation, configuration and troubleshooting, see:
 
-For Scrypted installation, Apple Home setup, HomeKit configuration and
-troubleshooting, see:
-
-**[ABB HA Doorbell for Scrypted →](https://github.com/rankjie/abb-ha-doorbell)**
+**[ABB HA Doorbell Scrypted plugin →](https://github.com/rankjie/abb-ha-doorbell)**
 
 ## Entities
 
