@@ -703,7 +703,7 @@ class ABBWelcomeCamera(Camera):
         self.async_write_ha_state()
 
     @property
-    def camera_capabilities(self) -> CameraCapabilities:
+    def _legacy_camera_capabilities(self) -> CameraCapabilities:
         return CameraCapabilities(frontend_stream_types={StreamType.WEB_RTC})
 
     @property
@@ -1164,7 +1164,7 @@ class ABBWelcomeCamera(Camera):
     # WebRTC offer / candidate forwarding to go2rtc                      #
     # ------------------------------------------------------------------ #
 
-    async def async_handle_async_webrtc_offer(
+    async def _legacy_async_handle_async_webrtc_offer(
         self,
         offer_sdp: str,
         session_id: str,
@@ -1271,7 +1271,7 @@ class ABBWelcomeCamera(Camera):
             except Exception as err:  # noqa: BLE001
                 _LOGGER.debug("[abb] queued candidate forward failed: %s", err)
 
-    async def async_on_webrtc_candidate(
+    async def _legacy_async_on_webrtc_candidate(
         self, session_id: str, candidate: RTCIceCandidateInit
     ) -> None:
         ws = self._ws_clients.get(session_id)
@@ -1286,7 +1286,7 @@ class ABBWelcomeCamera(Camera):
             _LOGGER.debug("[abb] forward candidate failed: %s", err)
 
     @callback
-    def close_webrtc_session(self, session_id: str) -> None:
+    def _legacy_close_webrtc_session(self, session_id: str) -> None:
         ws = self._ws_clients.pop(session_id, None)
         self._ws_pending_candidates.pop(session_id, None)
         if ws is not None:
