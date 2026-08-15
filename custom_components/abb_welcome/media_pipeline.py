@@ -16,8 +16,11 @@ the SIP call, TEARDOWN the RTSP session.
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
 import logging
 import math
+import re
 import secrets
 import socket
 import struct
@@ -25,6 +28,8 @@ from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
+
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 from .intercom_dialer import CallState, Door, IntercomDialer
 
@@ -76,6 +81,82 @@ def _rtp_payload(data: bytes) -> bytes | None:
             return None
         end -= padding
     return data[offset:end]
+
+
+
+def _rtp_payload_bounds(data: bytes) -> tuple[int, int] | None:
+    """Return [start, end) bounds of an RTP payload, excluding RTP padding."""
+    if len(data) < 12 or (data[0] >> 6) != 2:
+        return None
+    cc = data[0] & 0x0F
+    start = 12 + (cc * 4)
+    if len(data) < start:
+        return None
+    if data[0] & 0x10:
+        if len(data) < start + 4:
+            return None
+        extension_words = struct.unpack_from("!H", data, start + 2)[0]
+        start += 4 + (extension_words * 4)
+        if len(data) < start:
+            return None
+    end = len(data)
+    if data[0] & 0x20:
+        padding = data[-1]
+        if padding == 0 or padding > end - start:
+            return None
+        end -= padding
+    return start, end
+
+
+def _parse_abb_media_key(crypto_lines: list[str]) -> bytes | None:
+    """Extract ABB's 16-byte AES media key from the SDP crypto attribute."""
+    for value in crypto_lines:
+        if "AES_CM_128_HMAC_SHA1_32" not in value.upper():
+            continue
+        match = re.search(r"(?i)\binline:([^|\s]+)", value)
+        if match is None:
+            continue
+        try:
+            key = base64.b64decode(match.group(1), validate=True)
+        except Exception:  # noqa: BLE001
+            continue
+        if len(key) == 16:
+            return key
+    return None
+
+
+def _decrypt_abb_media_rtp(data: bytes, key: bytes) -> bytes | None:
+    """Decrypt ABB's SmartTouch media payload wrapper.
+
+    Wire payload:
+        uint16_be clear_length
+        AES-128-ECB(ciphertext), zero padded to a 16-byte boundary
+    """
+    bounds = _rtp_payload_bounds(data)
+    if bounds is None:
+        return None
+    start, end = bounds
+    payload = data[start:end]
+    if len(payload) < 2:
+        return None
+
+    clear_len = int.from_bytes(payload[:2], "big")
+    cipher_text = payload[2:]
+    expected_cipher_len = ((clear_len + 15) // 16) * 16
+    if clear_len <= 0 or expected_cipher_len != len(cipher_text):
+        return None
+
+    decryptor = Cipher(algorithms.AES(key), modes.ECB()).decryptor()
+    clear_padded = decryptor.update(cipher_text) + decryptor.finalize()
+    clear = clear_padded[:clear_len]
+
+    # ABB uses zero padding. This also prevents false-positive decryption of
+    # ordinary RTP packets that merely match the length formula by chance.
+    if any(clear_padded[clear_len:]):
+        return None
+
+    first = data[0] & ~0x20
+    return bytes((first,)) + data[1:start] + clear
 
 
 def _linear16_to_pcma_sample(sample: int) -> int:
@@ -320,11 +401,13 @@ class _RTPProtocol(asyncio.DatagramProtocol):
         rewrite_pt: int | None,
         on_first_packet: Callable[[bytes], None] | None,
         label: str = "rtp",
+        decrypt_key: bytes | None = None,
     ) -> None:
         self._on_packet = on_packet
         self._rewrite_pt = rewrite_pt
         self._on_first_packet = on_first_packet
         self.label = label
+        self._decrypt_key = decrypt_key
         self.transport: asyncio.DatagramTransport | None = None
         self.packets = 0
         self.bytes_received = 0
@@ -332,11 +415,20 @@ class _RTPProtocol(asyncio.DatagramProtocol):
         self.media_ssrc = 0
         self.payload_types: dict[int, int] = {}
         self._rewrites = 0
+        self.decrypt_ok = 0
+        self.decrypt_failed = 0
+        self.rtcp_dropped = 0
 
     def connection_made(self, transport: asyncio.DatagramTransport) -> None:
         self.transport = transport
 
     def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
+        # ABB sometimes sends RTCP on the media socket. Never forward it as
+        # H.264/PCMA RTP.
+        if len(data) >= 2 and 192 <= data[1] <= 223:
+            self.rtcp_dropped += 1
+            return
+
         self.packets += 1
         self.bytes_received += len(data)
         if len(data) >= 12:
@@ -345,6 +437,36 @@ class _RTPProtocol(asyncio.DatagramProtocol):
             self.last_seq = struct.unpack_from("!H", data, 2)[0]
             if self.media_ssrc == 0:
                 self.media_ssrc = struct.unpack_from("!I", data, 8)[0]
+
+            if self._decrypt_key is not None:
+                decrypted = _decrypt_abb_media_rtp(data, self._decrypt_key)
+                if decrypted is None:
+                    self.decrypt_failed += 1
+                    if self.decrypt_failed <= 3:
+                        _LOGGER.warning(
+                            "[abb] media: %s AES decrypt rejected seq=%d payload_len=%d",
+                            self.label,
+                            self.last_seq,
+                            len(_rtp_payload(data) or b""),
+                        )
+                    return
+                data = decrypted
+                self.decrypt_ok += 1
+                if self.decrypt_ok <= 3:
+                    payload = _rtp_payload(data) or b""
+                    nal_type = (
+                        (payload[0] & 0x1F)
+                        if self.label == "video" and payload
+                        else None
+                    )
+                    _LOGGER.info(
+                        "[abb] media: %s AES decrypt OK seq=%d clear_payload=%d nal_type=%s",
+                        self.label,
+                        self.last_seq,
+                        len(payload),
+                        nal_type if nal_type is not None else "-",
+                    )
+
             if self._rewrite_pt is not None and pt != self._rewrite_pt:
                 marker = data[1] & 0x80
                 data = (
@@ -352,6 +474,7 @@ class _RTPProtocol(asyncio.DatagramProtocol):
                     + data[2:]
                 )
                 self._rewrites += 1
+
         if self.packets == 1 and self._on_first_packet is not None:
             try:
                 self._on_first_packet(data)
@@ -427,6 +550,8 @@ class StreamSession:
         self._video_fmtp: str | None = None
         self._remote_audio_pt = 8
         self._remote_video_pt = 102
+        self._audio_crypto_key: bytes | None = None
+        self._video_crypto_key: bytes | None = None
         self._talk_sender: _PCMATalkSender | None = None
 
         self._stop = asyncio.Event()
@@ -553,6 +678,12 @@ class StreamSession:
                 m.payload_types, m.rtpmap, m.direction,
             )
             if m.media == "audio" and m.connection_ip and m.port:
+                self._audio_crypto_key = _parse_abb_media_key(m.crypto)
+                if self._audio_crypto_key is not None:
+                    _LOGGER.info(
+                        "[abb] media: audio AES wrapper enabled key_sha256=%s",
+                        hashlib.sha256(self._audio_crypto_key).hexdigest()[:12],
+                    )
                 if m.payload_types:
                     self._remote_audio_pt = (
                         8
@@ -564,6 +695,12 @@ class StreamSession:
                     video=self._endpoints.video,
                 )
             elif m.media == "video" and m.connection_ip and m.port:
+                self._video_crypto_key = _parse_abb_media_key(m.crypto)
+                if self._video_crypto_key is not None:
+                    _LOGGER.info(
+                        "[abb] media: video AES wrapper enabled key_sha256=%s",
+                        hashlib.sha256(self._video_crypto_key).hexdigest()[:12],
+                    )
                 if m.payload_types:
                     self._remote_video_pt = next(
                         (
@@ -595,9 +732,13 @@ class StreamSession:
                     if len(data) >= 12 else 0
                 )
                 try:
+                    rtcp_dest = (
+                        self._endpoints.video[0],
+                        self._endpoints.video[1] + 1,
+                    )
                     self._video_transport.sendto(
                         _build_rtcp_pli(0xCAFEBABE, ssrc),
-                        self._endpoints.video,
+                        rtcp_dest,
                     )
                 except OSError:
                     pass
@@ -617,6 +758,7 @@ class StreamSession:
             rewrite_pt=self.VIDEO_SDP_PT,
             on_first_packet=_video_first,
             label="video",
+            decrypt_key=self._video_crypto_key,
         )
         self._video_transport, _ = await loop.create_datagram_endpoint(
             lambda: self._video_proto, sock=self._video_sock
@@ -627,6 +769,7 @@ class StreamSession:
             rewrite_pt=None,
             on_first_packet=None,
             label="audio",
+            decrypt_key=self._audio_crypto_key,
         )
         self._audio_transport, _ = await loop.create_datagram_endpoint(
             lambda: self._audio_proto, sock=self._audio_sock
@@ -991,9 +1134,13 @@ class StreamSession:
             ):
                 continue
             try:
+                rtcp_dest = (
+                    self._endpoints.video[0],
+                    self._endpoints.video[1] + 1,
+                )
                 self._video_transport.sendto(
                     _build_rtcp_rr(0xCAFEBABE, vp.media_ssrc, vp.last_seq),
-                    self._endpoints.video,
+                    rtcp_dest,
                 )
             except OSError:
                 pass
@@ -1009,13 +1156,19 @@ class StreamSession:
             ap = self._audio_proto
             _LOGGER.info(
                 "[abb] media stats %s camera_index=%s: video pkts=%d pts=%s "
-                "rewrites=%d audio pkts=%d",
+                "rewrites=%d decrypt_ok=%d decrypt_failed=%d rtcp_dropped=%d "
+                "audio pkts=%d audio_decrypt_ok=%d audio_decrypt_failed=%d",
                 self._door.name,
                 self._camera_index if self._camera_index is not None else "default",
                 vp.packets if vp else 0,
                 dict(vp.payload_types) if vp else {},
                 vp._rewrites if vp else 0,
+                vp.decrypt_ok if vp else 0,
+                vp.decrypt_failed if vp else 0,
+                vp.rtcp_dropped if vp else 0,
                 ap.packets if ap else 0,
+                ap.decrypt_ok if ap else 0,
+                ap.decrypt_failed if ap else 0,
             )
             if self._talk_sender is not None:
                 _LOGGER.info(
