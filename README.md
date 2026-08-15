@@ -1,6 +1,6 @@
 # ABB Welcome - Home Assistant integration
 
-[![Open your Home Assistant instance and open a repository inside the Home Assistant Community Store.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=rankjie&repository=ha-abb-welcome&category=integration)
+[![Open your Home Assistant instance and open a repository inside the Home Assistant Community Store.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=aharder3&repository=ha-abb-welcome-smarttouch&category=integration)
 
 Local controls, ring detection, and live intercom streams for ABB Welcome /
 Busch-Jaeger building intercoms backed by a **classic IP gateway** or an
@@ -85,12 +85,12 @@ certificate and ACL. After pairing, SIP/intercom media runs locally.
 
 Click the badge to add this repository to HACS:
 
-[![Open your Home Assistant instance and open a repository inside the Home Assistant Community Store.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=rankjie&repository=ha-abb-welcome&category=integration)
+[![Open your Home Assistant instance and open a repository inside the Home Assistant Community Store.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=aharder3&repository=ha-abb-welcome-smarttouch&category=integration)
 
 Then install **ABB Welcome** from HACS and restart Home Assistant.
 
 If the badge does not work, open HACS -> **Custom repositories**, add
-`https://github.com/rankjie/ha-abb-welcome` as an *Integration*, and install it.
+`https://github.com/aharder3/ha-abb-welcome-smarttouch` as an *Integration*, and install it.
 
 ### Manual
 
