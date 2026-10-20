@@ -206,7 +206,12 @@ are mainly intended for the Scrypted plugin.
 The audio format for `talk_pcm16le` is base64-encoded 8 kHz mono signed 16-bit
 little-endian PCM. HA converts it to continuous PCMA/G.711 A-law RTP on the
 active call's audio leg. Idle talkback sends silence continuously, and voice
-frames are queued into the same RTP sequence.
+frames are queued into the same RTP sequence. When the SIP media SDP provides
+an ABB 16-byte AES key, talkback uses the same ABB RTP media envelope as
+incoming traffic (a 2-byte plaintext-length field plus AES-ECB ciphertext).
+Without a negotiated key, the legacy unencrypted RTP path is preserved.
+Encrypted incoming audio without a usable SDP key is discarded with a warning,
+rather than passed to go2rtc as noise.
 
 Scrypted assigns a per-client `talkback_session_id` so stale clients cannot stop
 or overwrite a newer microphone session.
