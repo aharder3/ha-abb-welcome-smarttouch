@@ -92,10 +92,71 @@ def test_silence_constant_matches_zero_sample() -> None:
     assert mp._PCMA_SILENCE_20MS == bytes([mp._linear16_to_pcma_sample(0)]) * 160
 
 
+
+def test_abb_aes_rtp_talkback_matches_original_packet_shape() -> None:
+    """AES RTP uses a 2-byte clear length and encrypted 16-byte blocks."""
+    class FakeTransport:
+        def __init__(self) -> None:
+            self.sent: list[bytes] = []
+
+        def sendto(self, packet: bytes, dest: tuple[str, int]) -> None:
+            self.sent.append(packet)
+
+    transport = FakeTransport()
+    key = bytes(range(16))
+    sender = mp._PCMATalkSender(
+        transport, ("127.0.0.1", 9000), encrypt_key=key
+    )
+    pcma = b"\xd5" * 160
+    initial_timestamp = sender.timestamp
+    sender._send_pcma(pcma)
+    packet = transport.sent[0]
+    assert len(packet) == 174  # 12 RTP + 2 length + 160 AES
+    assert packet[:2] == b"\x80\x08"
+    assert packet[12:14] == b"\x00\xa0"
+    assert packet[14:30] == packet[30:46]  # ECB pattern for A-law silence
+    assert packet[14:30] != pcma[:16]
+    assert mp._decrypt_abb_media_rtp(packet, key) == packet[:12] + pcma
+    assert sender.timestamp == (initial_timestamp + 160) & 0xFFFFFFFF
+    assert sender.stats()["encrypted"] is True
+
+
+def test_abb_aes_rtp_zero_padding_roundtrip() -> None:
+    key = bytes(range(16))
+    for n in (1, 79, 80, 81, 159, 160, 161):
+        pcma = bytes([0xD5]) * n
+        payload = mp._encrypt_abb_media_payload(pcma, key)
+        assert len(payload) == 2 + ((n + 15) // 16) * 16
+        packet = struct.pack("!BBHII", 0x80, 8, 123, 456, 789) + payload
+        assert mp._decrypt_abb_media_rtp(packet, key) == packet[:12] + pcma
+
+
+def test_missing_sdp_key_drops_encrypted_audio_not_plain_audio() -> None:
+    packets: list[bytes] = []
+    receiver = mp._RTPProtocol(
+        packets.append, rewrite_pt=None, on_first_packet=None, label="audio"
+    )
+    header = struct.pack("!BBHII", 0x80, 8, 123, 456, 789)
+    encrypted = header + mp._encrypt_abb_media_payload(
+        b"\xd5" * 160, bytes(range(16))
+    )
+    receiver.datagram_received(encrypted, ("127.0.0.1", 9000))
+    assert packets == []
+    assert receiver.missing_crypto_dropped == 1
+    receiver.datagram_received(header + b"\xd5" * 160, ("127.0.0.1", 9000))
+    assert packets == [header + b"\xd5" * 160]
+    receiver.datagram_received(b"\x00" * 20, ("127.0.0.1", 9000))
+    assert receiver.invalid_rtp_dropped == 1
+
+
+
 if __name__ == "__main__":
     test_table_matches_scalar_for_every_sample()
     test_encode_matches_reference_full_range()
     test_encode_matches_reference_varied_buffers()
     test_encode_ignores_trailing_odd_byte()
     test_silence_constant_matches_zero_sample()
+    test_abb_aes_rtp_talkback_matches_original_packet_shape()
+    test_abb_aes_rtp_zero_padding_roundtrip()
+    test_missing_sdp_key_drops_encrypted_audio_not_plain_audio()
     print(f"OK  numpy_fast_path={'yes' if mp._ALAW_LUT is not None else 'no (fallback)'}")
