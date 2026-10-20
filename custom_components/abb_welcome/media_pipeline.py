@@ -39,6 +39,26 @@ _KEEPALIVE_INTERVAL = 1.0
 _RTCP_INTERVAL = 5.0
 _PCMA_SILENCE_20MS = b"\xd5" * 160
 
+def _abb_encrypted_payload_length(payload: bytes) -> int | None:
+    """Recognise ABB's two-byte length followed by AES-aligned ciphertext."""
+    if len(payload) < 18:
+        return None
+    clear_length = int.from_bytes(payload[:2], "big")
+    if clear_length <= 0 or ((clear_length + 15) // 16) * 16 != len(payload) - 2:
+        return None
+    return clear_length
+
+
+def _encrypt_abb_media_payload(clear: bytes, key: bytes) -> bytes:
+    """Wrap a PCMA frame using the same AES-ECB envelope as received ABB RTP."""
+    if len(key) != 16:
+        raise ValueError("ABB AES media key must be 16 bytes")
+    if not clear or len(clear) > 0xFFFF:
+        raise ValueError("ABB media frame must be 1..65535 bytes")
+    padded = clear + b"\x00" * ((-len(clear)) % 16)
+    encryptor = Cipher(algorithms.AES(key), modes.ECB()).encryptor()
+    return struct.pack("!H", len(clear)) + encryptor.update(padded) + encryptor.finalize()
+
 
 def _build_rtp_keepalive(seq: int, pt: int = 0) -> bytes:
     return struct.pack("!BBHII", 0x80, pt & 0x7F, seq & 0xFFFF, 0, 0xCAFEBABE)
@@ -140,11 +160,10 @@ def _decrypt_abb_media_rtp(data: bytes, key: bytes) -> bytes | None:
     if len(payload) < 2:
         return None
 
-    clear_len = int.from_bytes(payload[:2], "big")
-    cipher_text = payload[2:]
-    expected_cipher_len = ((clear_len + 15) // 16) * 16
-    if clear_len <= 0 or expected_cipher_len != len(cipher_text):
+    clear_len = _abb_encrypted_payload_length(payload)
+    if clear_len is None:
         return None
+    cipher_text = payload[2:]
 
     decryptor = Cipher(algorithms.AES(key), modes.ECB()).decryptor()
     clear_padded = decryptor.update(cipher_text) + decryptor.finalize()
@@ -225,6 +244,7 @@ class _PCMATalkSender:
         dest: tuple[str, int],
         *,
         payload_type: int = 8,
+        encrypt_key: bytes | None = None,
         samples_per_packet: int = 160,
         packet_rate: int = 50,
         max_queue_frames: int = 25,
@@ -232,6 +252,9 @@ class _PCMATalkSender:
         self.transport = transport
         self.dest = dest
         self.payload_type = payload_type
+        if encrypt_key is not None and len(encrypt_key) != 16:
+            raise ValueError("ABB AES media key must be 16 bytes")
+        self._encrypt_key = encrypt_key
         self.samples_per_packet = samples_per_packet
         self.interval = 1.0 / packet_rate
         self.max_queue_frames = max_queue_frames
@@ -344,9 +367,14 @@ class _PCMATalkSender:
             self.timestamp & 0xFFFFFFFF,
             self.ssrc & 0xFFFFFFFF,
         )
-        self.transport.sendto(header + payload, self.dest)
+        wire_payload = (
+            _encrypt_abb_media_payload(payload, self._encrypt_key)
+            if self._encrypt_key is not None
+            else payload
+        )
+        self.transport.sendto(header + wire_payload, self.dest)
         self.packets_sent += 1
-        self.bytes_sent += len(header) + len(payload)
+        self.bytes_sent += len(header) + len(wire_payload)
         self.seq = (self.seq + 1) & 0xFFFF
         self.timestamp = (self.timestamp + len(payload)) & 0xFFFFFFFF
 
@@ -363,6 +391,7 @@ class _PCMATalkSender:
             "dropped_frames": self.dropped_frames,
             "queue_frames": len(self._queued_pcma),
             "payload_type": self.payload_type,
+            "encrypted": self._encrypt_key is not None,
             "ssrc": self.ssrc,
             "dest": f"{self.dest[0]}:{self.dest[1]}",
         }
@@ -418,11 +447,16 @@ class _RTPProtocol(asyncio.DatagramProtocol):
         self.decrypt_ok = 0
         self.decrypt_failed = 0
         self.rtcp_dropped = 0
+        self.invalid_rtp_dropped = 0
+        self.missing_crypto_dropped = 0
 
     def connection_made(self, transport: asyncio.DatagramTransport) -> None:
         self.transport = transport
 
     def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
+        if len(data) < 12 or (data[0] >> 6) != 2:
+            self.invalid_rtp_dropped += 1
+            return
         # ABB sometimes sends RTCP on the media socket. Never forward it as
         # H.264/PCMA RTP.
         if len(data) >= 2 and 192 <= data[1] <= 223:
@@ -437,6 +471,23 @@ class _RTPProtocol(asyncio.DatagramProtocol):
             self.last_seq = struct.unpack_from("!H", data, 2)[0]
             if self.media_ssrc == 0:
                 self.media_ssrc = struct.unpack_from("!I", data, 8)[0]
+
+            # Ciphertext without the SDP media key is not G.711 audio:
+            # forwarding it to go2rtc produces loud static.
+            if self.label == "audio" and self._decrypt_key is None:
+                raw_payload = _rtp_payload(data)
+                if (
+                    raw_payload is not None
+                    and _abb_encrypted_payload_length(raw_payload) is not None
+                ):
+                    self.missing_crypto_dropped += 1
+                    if self.missing_crypto_dropped <= 3:
+                        _LOGGER.warning(
+                            "[abb] media: encrypted audio RTP received without "
+                            "an SDP AES media key; dropping ciphertext instead "
+                            "of forwarding it as PCMA"
+                        )
+                    return
 
             if self._decrypt_key is not None:
                 decrypted = _decrypt_abb_media_rtp(data, self._decrypt_key)
@@ -792,6 +843,7 @@ class StreamSession:
                 self._audio_transport,
                 self._endpoints.audio,
                 payload_type=self._remote_audio_pt,
+                encrypt_key=self._audio_crypto_key,
             )
             await self._talk_sender.start()
             _LOGGER.info(
