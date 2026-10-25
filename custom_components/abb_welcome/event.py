@@ -15,7 +15,7 @@ from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DOMAIN
-from .coordinator import ABBWelcomeCoordinator
+from .coordinator import ABBWelcomeCoordinator, ABBWelcomeData
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -80,9 +80,21 @@ class ABBWelcomeEventEntity(EventEntity):
             model="IP Gateway (MRANGE)",
         )
         self._last_seen_id = ""
+        self._seeded = False
 
     async def async_added_to_hass(self) -> None:
-        self._coordinator.async_add_listener(self._handle_update)
+        # The coordinator keeps no history across restarts: the first poll
+        # returns the portal's recent events, which are history, not new
+        # activity.  Take whatever is already loaded as the baseline.
+        self._seed_from(self._coordinator.data)
+        self.async_on_remove(
+            self._coordinator.async_add_listener(self._handle_update)
+        )
+
+    def _seed_from(self, data: ABBWelcomeData | None) -> None:
+        if data and data.events:
+            self._last_seen_id = data.events[0].event_id
+            self._seeded = True
 
     @callback
     def _handle_update(self) -> None:
@@ -90,9 +102,22 @@ class ABBWelcomeEventEntity(EventEntity):
         if not data or not data.events:
             return
 
+        if not self._seeded:
+            # First data after the entity was added (initial poll was still
+            # pending or failed): baseline it without firing.
+            self._seed_from(data)
+            return
+
+        new_events = []
         for evt in data.events:
             if evt.event_id == self._last_seen_id:
                 break
+            new_events.append(evt)
+        self._last_seen_id = data.events[0].event_id
+
+        # Events are newest first; fire oldest first so the entity ends on
+        # the newest event.
+        for evt in reversed(new_events):
             if evt.event_type == "screenshot":
                 continue
 
@@ -115,6 +140,7 @@ class ABBWelcomeEventEntity(EventEntity):
                     "event_id": evt.event_id,
                 },
             )
-
-        if data.events:
-            self._last_seen_id = data.events[0].event_id
+            # _trigger_event does not write state.  Write after each one so
+            # every event gets its own state change (logbook, recorder,
+            # event triggers), not just the last of the poll.
+            self.async_write_ha_state()
